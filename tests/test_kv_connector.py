@@ -22,6 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -51,12 +56,19 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         # Worker half: loads it was told to start, and what to report next.
         self.loads_started: dict[str, list[int]] = {}
         self.finished_recving: set[str] = set()
+        self.finished_sending: set[str] = set()
+        self.kv_caches = None
+        # Scheduler half: keep a finished request's blocks until its KV is sent.
+        self.delay_free = False
 
     # Worker half.
 
     def bind_connector_metadata(self, connector_metadata):
         self.calls.append("bind")
         super().bind_connector_metadata(connector_metadata)
+
+    def register_kv_caches(self, kv_caches):
+        self.kv_caches = kv_caches
 
     def handle_preemptions(self, kv_connector_metadata):
         self.calls.append("handle_preemptions")
@@ -76,8 +88,9 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_finished(self, finished_req_ids):
         self.calls.append("get_finished")
+        finished_sending, self.finished_sending = self.finished_sending, set()
         finished_recving, self.finished_recving = self.finished_recving, set()
-        return None, finished_recving
+        return finished_sending, finished_recving
 
     def clear_connector_metadata(self):
         self.calls.append("clear")
@@ -100,7 +113,7 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def request_finished_all_groups(self, request, block_ids):
-        return False, None
+        return self.delay_free, None
 
 
 @pytest.fixture
@@ -126,13 +139,23 @@ def _scheduler_output(*, scheduled: bool) -> SchedulerOutput:
     return output
 
 
-def _runner_output() -> ModelRunnerOutput:
-    return ModelRunnerOutput(req_ids=["req-0"], req_id_to_index={"req-0": 0})
-
-
 def _runner(vllm_config, calls: list[str], *, async_decode: bool) -> SimpleNamespace:
     """A runner whose forward and sampling are doubles, as in the grammar tests."""
     model_input = _model_input()
+    scheduled: list[str] = []
+
+    def build_model_input(scheduler_output, _grammar):
+        scheduled[:] = scheduler_output.num_scheduled_tokens
+        return model_input if scheduled else None
+
+    def _runner_output(*_args, **_kwargs):
+        return ModelRunnerOutput(
+            req_ids=list(scheduled),
+            req_id_to_index={req_id: i for i, req_id in enumerate(scheduled)},
+            sampled_token_ids=[[7] for _ in scheduled],
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
 
     def forward(received_input):
         calls.append("forward")
@@ -142,7 +165,7 @@ def _runner(vllm_config, calls: list[str], *, async_decode: bool) -> SimpleNames
         calls.append("forward")
         controller = SimpleNamespace(
             complete_decode_step=lambda **_kwargs: SimpleNamespace(),
-            build_runner_output_from_completed_step=lambda _done: _runner_output(),
+            build_runner_output_from_completed_step=_runner_output,
             enqueue_completed_decode_step=lambda _done: None,
         )
         return AsyncTTModelRunnerOutput(
@@ -160,12 +183,10 @@ def _runner(vllm_config, calls: list[str], *, async_decode: bool) -> SimpleNames
         async_decode_scheduling=async_decode,
         scheduler_config=SimpleNamespace(async_scheduling=async_decode),
         _pending_samples=deque(),
-        build_model_input=lambda scheduler_output, _grammar: (
-            model_input if scheduler_output.total_num_scheduled_tokens else None
-        ),
+        build_model_input=build_model_input,
         _forward_with_model_input=forward,
         _sample_sync_forward=lambda _fwd: ([torch.tensor([[42]])], [None]),
-        apply_and_build_runner_output=lambda *_args, **_kwargs: _runner_output(),
+        apply_and_build_runner_output=_runner_output,
         _num_speculative_tokens=0,
     )
     for name in (
@@ -282,3 +303,96 @@ def test_a_remote_load_is_not_lost_when_the_step_falls_back_to_decode():
     step = scheduler.schedule()
 
     assert step.num_scheduled_tokens == {"B": 40}
+
+
+def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
+    """``TTModelRunner.initialize_kv_cache`` over a model holding ``kv_caches``."""
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    runner = SimpleNamespace(
+        tt_max_batch_size=2,
+        model_config=SimpleNamespace(max_model_len=BLOCK_SIZE),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=BLOCK_SIZE),
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
+        vocab_size=8,
+        _is_lane_mode=False,
+        _host_logitsprocs=None,
+        _is_block_output_model=False,
+        _output_tokens_per_step=1,
+        _validate_kv_cache_groups=TTModelRunner._validate_kv_cache_groups,
+        _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
+    )
+    TTModelRunner.initialize_kv_cache(
+        runner,
+        KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names, spec)],
+        ),
+    )
+
+
+def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
+    layer_names = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
+
+    _initialize_kv_cache(layer_names, [["k0", "v0"], ["k1", "v1"]])
+
+    assert list(worker_connector.kv_caches) == layer_names
+    for description in worker_connector.kv_caches.values():
+        # (num_blocks, num_kv_heads, block_size, K and V of head_size 1)
+        assert description.shape == (4, 1, BLOCK_SIZE, 2)
+        assert description.dtype == torch.float32
+        # One element stands in for the whole shape.
+        assert description.untyped_storage().nbytes() == 4
+
+
+def _run_step(scheduler, runner) -> SchedulerOutput:
+    """One engine step: schedule, run the forward, sample, report back."""
+    step = scheduler.schedule()
+    output = TTModelRunner.execute_model(runner, step)
+    if output is None:
+        output = TTModelRunner.sample_tokens(runner, None)
+    scheduler.update_from_output(step, output)
+    return step
+
+
+@pytest.mark.parametrize("another_request_is_decoding", [False, True])
+def test_a_request_loads_remote_kv_then_holds_its_blocks_until_sent(
+    worker_connector, another_request_is_decoding
+):
+    """One request through the whole connector lifecycle, scheduler to runner."""
+    scheduler = _scheduler_with_running_decode()
+    runner = _runner(scheduler.vllm_config, [], async_decode=False)
+    if not another_request_is_decoding:
+        scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
+    scheduler.connector.external_tokens["B"] = BLOCK_SIZE
+    scheduler.connector.delay_free = True
+    request = _request(1, request_id="B", prompt_length=BLOCK_SIZE + 40)
+    scheduler.add_request(request)
+
+    # B is parked on its load. The instruction reaches the worker half, either
+    # with A's decode or on a step that schedules no tokens at all.
+    step = _run_step(scheduler, runner)
+    scheduled = {"A"} if another_request_is_decoding else set()
+    assert set(step.num_scheduled_tokens) == scheduled
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    (b_block_ids,) = scheduler.kv_cache_manager.get_block_ids("B")
+    assert worker_connector.loads_started == {"B": b_block_ids}
+
+    # The worker half reports the load; the scheduler hears it on that step's
+    # output and prefills the rest of B's prompt on the next one.
+    worker_connector.finished_recving = {"B"}
+    _run_step(scheduler, runner)
+    step = _run_step(scheduler, runner)
+    assert step.num_scheduled_tokens["B"] == 40
+
+    # B's one token finished it, but the connector asked to send its KV first.
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    block_pool = scheduler.kv_cache_manager.block_pool
+    free_blocks_while_held = block_pool.get_num_free_blocks()
+    assert "B" in scheduler.requests
+    worker_connector.finished_sending = {"B"}
+    _run_step(scheduler, runner)
+    assert "B" not in scheduler.requests
+    assert block_pool.get_num_free_blocks() == free_blocks_while_held + 2
