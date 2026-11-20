@@ -27,6 +27,7 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.core_client as core_client
     import vllm.v1.engine.input_processor as input_processor
+    from vllm.distributed.kv_transfer import kv_transfer_state
     from vllm.entrypoints.launchers.utils import server_utils
 
     from vllm_tt_plugin.platform import TTPlatform
@@ -38,6 +39,7 @@ def reset_tt_platform_class_state():
         if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
     }
     saved_empty_cache = torch.accelerator.empty_cache
+    saved_sync_engine_id = kv_transfer_state._sync_engine_id_across_tp
 
     unset = object()
     saved = {
@@ -100,6 +102,7 @@ def reset_tt_platform_class_state():
             elif getattr(module.lifespan, "_tt_lifespan_gc_patch", False):
                 module.lifespan = saved_lifespan
     torch.accelerator.empty_cache = saved_empty_cache
+    kv_transfer_state._sync_engine_id_across_tp = saved_sync_engine_id
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler

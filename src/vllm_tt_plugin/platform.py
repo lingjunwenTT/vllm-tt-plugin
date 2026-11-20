@@ -762,6 +762,41 @@ def _install_torch_accelerator_cleanup_patch() -> None:
     torch.accelerator.empty_cache = empty_cache
 
 
+def _install_tt_kv_engine_id_sync_patch() -> None:
+    """Skip the KV connector engine-ID broadcast when there is one rank.
+
+    ``ensure_kv_transfer_initialized`` broadcasts the engine ID from TP rank 0
+    through ``get_tp_group()``. TT pins tensor and pipeline parallelism to 1
+    and never creates that ``torch.distributed`` group, so the lookup would
+    raise; with one rank there is nobody to broadcast to.
+    """
+    from vllm.distributed.kv_transfer import kv_transfer_state
+
+    original = getattr(kv_transfer_state, "_sync_engine_id_across_tp", None)
+    if original is None:
+        raise RuntimeError(
+            "vllm.distributed.kv_transfer.kv_transfer_state no longer defines "
+            "_sync_engine_id_across_tp; update _install_tt_kv_engine_id_sync_patch "
+            "for this vLLM version."
+        )
+    if getattr(original, "_tt_single_rank_guard", False):
+        return
+
+    @wraps(original)
+    def sync_engine_id(vllm_config):
+        parallel_config = vllm_config.parallel_config
+        if (
+            parallel_config.tensor_parallel_size
+            * parallel_config.pipeline_parallel_size
+            == 1
+        ):
+            return None
+        return original(vllm_config)
+
+    sync_engine_id._tt_single_rank_guard = True
+    kv_transfer_state._sync_engine_id_across_tp = sync_engine_id
+
+
 def _install_diffusion_gemma_architecture_patch() -> None:
     """Resolve DiffusionGemma through its TT architecture before config hooks.
 
@@ -2399,6 +2434,8 @@ class TTPlatform(Platform):
 
         _install_tt_input_processor_patch()
         _install_tt_dp_prefix_cache_routing_patch()
+        if vllm_config.kv_transfer_config is not None:
+            _install_tt_kv_engine_id_sync_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
 
