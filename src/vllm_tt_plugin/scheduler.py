@@ -378,6 +378,9 @@ class TTScheduler(AsyncScheduler):
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
+    # True while ``schedule`` runs a prefill pass whose result it replaces
+    # with a decode pass if the prefill pass schedules no tokens.
+    _empty_prefill_pass_is_replaced = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -906,7 +909,9 @@ class TTScheduler(AsyncScheduler):
                 )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result, is_decode=True)
+            self._empty_prefill_pass_is_replaced = has_running_decode
             prefill_result = self._schedule_prefill_only()
+            self._empty_prefill_pass_is_replaced = False
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
             # and free capacity for a later prefill admission.
@@ -934,6 +939,22 @@ class TTScheduler(AsyncScheduler):
         self._decode_interleave.record_step(is_decode=True, prefill_pending=False)
         result = super().schedule()
         return self._finalize_scheduler_output(result, is_decode=True)
+
+    def _build_kv_connector_meta(self, connector, scheduler_output):
+        """Keep connector instructions out of a prefill pass that is discarded.
+
+        Building the metadata empties the connector's pending instructions
+        into the output it is built for. A request parked on a remote KV load
+        schedules no tokens, so its load instruction is built by exactly the
+        empty prefill pass that ``schedule`` replaces with a decode pass. Leave
+        the instructions pending there; the decode pass builds them.
+        """
+        if (
+            self._empty_prefill_pass_is_replaced
+            and scheduler_output.total_num_scheduled_tokens == 0
+        ):
+            return None
+        return super()._build_kv_connector_meta(connector, scheduler_output)
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool
