@@ -747,6 +747,32 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(
+                TTModelRunner._kv_caches_by_layer_name(self, kv_cache_groups)
+            )
+
+    def _kv_caches_by_layer_name(self, kv_cache_groups: list) -> dict[str, Any]:
+        """The model's KV cache entries keyed by ``kv_cache_config`` layer name.
+
+        This is what a KV connector is handed. Each value is the entry the
+        model allocated for that attention layer, unchanged. It needs one name
+        per attention layer, which only a model class with a
+        ``get_kv_cache_spec`` hook reports; the default spec has a single
+        placeholder name for all layers.
+        """
+        layer_names = [name for group in kv_cache_groups for name in group.layer_names]
+        if not isinstance(self.kv_caches, (list, tuple)) or len(layer_names) != len(
+            self.kv_caches
+        ):
+            raise ValueError(
+                "A KV connector needs one kv_cache_config layer name per KV cache "
+                f"entry the model allocated; got layer names {layer_names} and "
+                f"kv_caches={self.kv_caches!r}. The model class must report "
+                "per-layer names through get_kv_cache_spec and allocate a "
+                "per-layer list."
+            )
+        return {name: self.kv_caches[_parse_layer_index(name)] for name in layer_names}
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
