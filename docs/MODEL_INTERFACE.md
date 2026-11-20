@@ -50,10 +50,15 @@ runs vLLM's KV connector lifecycle; lane-DP and multi-process DP reject the
 option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
 `register_kv_caches` once, after the model adapter allocates KV storage. The
 argument is a dictionary keyed by the layer names in `kv_cache_config`. Each
-value is a torch tensor that only describes that layer's KV cache: it has
-vLLM's logical shape `(num_blocks, num_kv_heads, block_size, 2 * head_size)`
-and the spec's dtype, and holds no KV. The KV stays in the ttnn tensors the
-adapter allocated.
+value is a torch tensor that only describes that layer's KV cache and holds no
+KV. The KV stays in the ttnn tensors the adapter allocated. A layer whose
+cache is `bfloat8_b` is described as bytes, `(num_blocks, num_kv_heads,
+block_size, n)` `uint8`, sized so that a block is exactly the packed tiles of
+its K and V on every chip; the copy below moves those tiles unchanged, so both
+servers of a transfer need a `bfloat8_b` cache with the same total KV heads,
+head size and block size. Their chip counts may differ. Any other
+layer has vLLM's logical shape `(num_blocks, num_kv_heads, block_size,
+2 * head_size)` and the spec's dtype.
 
 A model class without a `get_kv_cache_spec` hook gets one layer name per
 attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
