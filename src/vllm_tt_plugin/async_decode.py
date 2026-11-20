@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import ttnn
-from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
@@ -246,6 +251,9 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
         self._cached_exception = None
         self._finalize_lock = threading.Lock()
 
+        # With a KV connector, tells the scheduler which transfers finished or failed.
+        self.kv_connector_output: KVConnectorOutput | None = None
+
     def ensure_finalized(self) -> Any:
         if self._finalized:
             return self._replay()
@@ -325,6 +333,7 @@ class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
+        runner_output.kv_connector_output = self.kv_connector_output
         return runner_output
 
 
@@ -391,6 +400,7 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
+        runner_output.kv_connector_output = self.kv_connector_output
         return runner_output
 
 
