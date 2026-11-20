@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import (
@@ -434,6 +440,10 @@ class TTWorker(WorkerBase):
     def _build_default_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Single-layer spec used by the legacy non-hybrid path. Downstream
         sizing is overridden via ``cache_config.num_gpu_blocks_override``.
+
+        With a KV connector the same spec is listed once per attention layer,
+        because a connector transfers and names each layer's KV separately.
+        Equal specs still form one KV cache group with one block table.
         """
         model_config = self.model_config
         parallel_config = self.parallel_config
@@ -467,7 +477,12 @@ class TTWorker(WorkerBase):
                 dtype=dtype,
                 sliding_window=sliding_window,
             )
-        return {"foo": attn_spec}
+        if self.vllm_config.kv_transfer_config is None:
+            return {"foo": attn_spec}
+        num_layers = model_config.get_num_layers_by_block_type(
+            parallel_config, "attention"
+        )
+        return {f"model.layers.{i}.self_attn": attn_spec for i in range(num_layers)}
 
     def determine_available_memory(self) -> int:
         """
@@ -504,8 +519,26 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank. Without a token KV cache
         the config has no KV groups.
+
+        The worker-side KV connector is created first, when one is configured,
+        so it exists by the time the runner allocates the KV cache.
         """
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(self) -> dict[tuple[int, int], Any] | None:
+        """This worker's connector handshake metadata, keyed ``(pp_rank, tp_rank)``.
+
+        ``EngineCore`` calls this whenever a connector is configured and hands
+        the result to the scheduler-side connector. TT runs one worker, so the
+        key is always ``(0, 0)``.
+        """
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        if metadata is None:
+            return None
+        return {(0, 0): metadata}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -588,6 +621,12 @@ class TTWorker(WorkerBase):
         best-effort backstop and deliberately does not call it; see the note
         there.
         """
+        try:
+            # The connector may hold the model's KV tensors, so it lets go
+            # before the model and the mesh do.
+            ensure_kv_transfer_shutdown()
+        except Exception:
+            logger.exception("KV connector shutdown failed; closing the mesh anyway")
         if getattr(self, "model_runner", None) is not None:
             try:
                 self.model_runner.shutdown()

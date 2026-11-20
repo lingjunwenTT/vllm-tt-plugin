@@ -6,7 +6,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -15,6 +16,8 @@ import regex as re
 import torch
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.forward_context import set_forward_context
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -26,12 +29,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -66,6 +71,7 @@ from vllm_tt_plugin.input_batch import (
     clone_torch_generator,
     log_prefill_chunks,
 )
+from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
@@ -289,7 +295,7 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 _SUPPORTED_MM_MODALITIES = frozenset({"image", "video", "audio"})
 
 
-class TTModelRunner:
+class TTModelRunner(KVConnectorModelRunnerMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -742,6 +748,10 @@ class TTModelRunner:
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(
+                kv_cache_descriptions(kv_cache_config)
+            )
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -3215,9 +3225,21 @@ class TTModelRunner:
         ):
             self.async_decode.wait_for_all_pending_async_steps()
 
+        has_kv_connector = has_kv_transfer_group()
+        if has_kv_connector:
+            get_kv_transfer_group().handle_preemptions(
+                scheduler_output.kv_connector_metadata
+            )
+
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
         if model_input is None:
+            if has_kv_connector:
+                # A request parked on a remote KV load schedules no tokens, so
+                # this is the only step that polls whether its load finished.
+                return TTModelRunner.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
@@ -3231,10 +3253,12 @@ class TTModelRunner:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
-            wrapper = self.async_decode.submit_async_decode(
-                model_input,
-                steady_decode_fast_path=steady_decode_fast_path,
-            )
+            with TTModelRunner._kv_connector_step(self, scheduler_output) as kv_out:
+                wrapper = self.async_decode.submit_async_decode(
+                    model_input,
+                    steady_decode_fast_path=steady_decode_fast_path,
+                )
+            wrapper.kv_connector_output = kv_out
             self._pending_samples.append(
                 partial(
                     self._finish_async_decode,
@@ -3247,9 +3271,34 @@ class TTModelRunner:
 
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
-        fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
+        with TTModelRunner._kv_connector_step(self, scheduler_output) as kv_out:
+            fwd = self._forward_with_model_input(model_input)
+        self._pending_samples.append(
+            partial(self._finish_front_packed_sync, fwd=fwd, kv_out=kv_out)
+        )
         return None
+
+    @contextmanager
+    def _kv_connector_step(
+        self, scheduler_output: SchedulerOutput
+    ) -> Generator[KVConnectorOutput | None, None, None]:
+        """Run a forward submission inside the KV connector's step.
+
+        The connector binds this step's metadata and starts its loads, the body
+        submits the forward, then the connector is asked to finish its saves
+        and report completed transfers. The body only submits an async decode,
+        so there ``wait_for_save`` runs before the decode completes on device.
+        Yields the transfers to report with this step's output, or ``None``
+        when no connector is configured.
+        """
+        if not has_kv_transfer_group():
+            yield None
+            return
+        with (
+            set_forward_context(None, self.vllm_config),
+            TTModelRunner.maybe_get_kv_connector_output(scheduler_output) as kv_out,
+        ):
+            yield kv_out
 
     def _reorder_grammar_bitmask(
         self,
@@ -3804,11 +3853,15 @@ class TTModelRunner:
         return committed_by_req
 
     def _finish_front_packed_sync(
-        self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        fwd: _SyncForward | None,
+        kv_out: KVConnectorOutput | None = None,
     ) -> ModelRunnerOutput:
         deferred = bool(fwd is not None and fwd.model_input.defer_device_sampling)
         try:
-            return TTModelRunner._finish_front_packed_sync_impl(
+            output = TTModelRunner._finish_front_packed_sync_impl(
                 self,
                 grammar_output,
                 fwd=fwd,
@@ -3817,6 +3870,9 @@ class TTModelRunner:
             if deferred:
                 self._poison_device_grammar()
             raise
+        if kv_out is not None:
+            output.kv_connector_output = kv_out
+        return output
 
     def _finish_front_packed_sync_impl(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None

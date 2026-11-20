@@ -534,6 +534,25 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     )
 
 
+def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
+    """Refuse a KV connector outside the single-process, non-DP path.
+
+    Only ``TTWorker`` and ``TTModelRunner`` drive the worker-side connector, and
+    nothing coordinates one across DP ranks or TT lanes. Run after the
+    DP-to-lanes conversion, which resets ``data_parallel_size`` to 1 and records
+    the lane count instead, so both values are checked.
+    """
+    if vllm_config.kv_transfer_config is None:
+        return
+    data_parallel_size = vllm_config.parallel_config.data_parallel_size
+    lanes = get_tt_data_parallel_size(vllm_config)
+    if data_parallel_size != 1 or lanes != 1:
+        raise ValueError(
+            "--kv-transfer-config is supported only without data parallelism on "
+            f"TT; got data_parallel_size={data_parallel_size}, TT lanes={lanes}."
+        )
+
+
 def resolve_tt_scheduler_cls(
     requested: "str | type | None",
     worker_cls: "str | type",
