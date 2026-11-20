@@ -377,14 +377,11 @@ def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
 
 
 class FakeTTKVTensor:
-    """One layer's K or V on a one-chip mesh, as (blocks, heads, tokens, dim)."""
+    """One layer's K or V on device, as (blocks, heads, tokens, dim)."""
 
     def __init__(self):
         self.blocks = torch.zeros(4, 1, BLOCK_SIZE, 1)
         self.shape = self.blocks.shape
-
-    def device(self):
-        return SimpleNamespace(get_num_devices=lambda: 1)
 
 
 @pytest.fixture

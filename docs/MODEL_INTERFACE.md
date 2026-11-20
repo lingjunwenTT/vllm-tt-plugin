@@ -63,7 +63,9 @@ KV blocks between the adapter's ttnn tensors and a CPU buffer shaped like
 those descriptions. A connector that stages KV through such a buffer, like
 `NixlConnector` with `"kv_buffer_device": "cpu"`, moves KV with it. Startup
 raises unless the allocator returned one `[k, v]` pair per layer name, each
-name following the `...layers.<idx>...` convention, on a one-chip mesh.
+name following the `...layers.<idx>...` convention. On a mesh of several chips
+the copy takes each chip's tensor to hold an equal share of the KV heads, in
+chip order.
 
 ## Minimum implementation
 

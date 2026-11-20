@@ -62,32 +62,40 @@ def kv_tensors_by_layer_name(
     kv_tensors = {}
     for name, index in layer_index_by_name.items():
         k, v = per_layer[index]
-        if k.device().get_num_devices() != 1:
-            raise NotImplementedError(
-                "Copying KV between host and device is implemented for a "
-                f"one-chip mesh; layer {name} is on "
-                f"{k.device().get_num_devices()} chips."
-            )
         kv_tensors[name] = (k, v)
     return kv_tensors
 
 
 def _read_block(cache, block_id: int) -> torch.Tensor:
-    """One block of a paged ttnn KV cache as ``(heads, block_size, head_dim)``."""
+    """One block of a paged ttnn KV cache as ``(heads, block_size, head_dim)``.
+
+    Each chip of the mesh holds its own share of the heads; they are joined in
+    chip order.
+    """
     block = cache[block_id : block_id + 1]
-    values = ttnn.to_torch(block)[0]
+    per_chip = [ttnn.to_torch(chip) for chip in ttnn.get_device_tensors(block)]
     ttnn.deallocate(block)
-    return values
+    return torch.cat(per_chip, dim=1)[0]
 
 
 def _write_block(cache, block_id: int, values: torch.Tensor) -> None:
-    """Write ``(heads, block_size, head_dim)`` into one block of a KV cache."""
+    """Write ``(heads, block_size, head_dim)`` into one block of a KV cache.
+
+    The heads are split evenly over the chips of the mesh, in chip order.
+    """
     device = cache.device()
     block = ttnn.from_torch(
-        values.unsqueeze(0), dtype=cache.dtype, layout=ttnn.TILE_LAYOUT, device=device
+        values.unsqueeze(0),
+        dtype=cache.dtype,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        mesh_mapper=ttnn.ShardTensorToMesh(device, dim=1),
     )
     page_table = ttnn.from_torch(
-        torch.tensor([[block_id]], dtype=torch.int32), dtype=ttnn.int32, device=device
+        torch.tensor([[block_id]], dtype=torch.int32),
+        dtype=ttnn.int32,
+        device=device,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
     # The block is a one-block sequence whose page table names where it goes.
     ttnn.experimental.paged_fill_cache(cache, block, page_table, batch_idx=0)
