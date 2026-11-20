@@ -11,6 +11,7 @@ from collections import deque
 from functools import partial
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.config.kv_transfer import KVTransferConfig
@@ -160,15 +161,21 @@ def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
     # The platform config hook installs this in a server.
     _install_tt_nixl_single_rank_patch()
 
+    k = FakePackedKVTensor(heads=spec.num_kv_heads // CHIPS)
+    kv_tensors = {"model.layers.0.self_attn": (k, FakePackedKVTensor(k.shape[1]))}
+
     connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
     try:
-        connector.register_kv_caches(kv_cache_descriptions(kv_cache_config))
+        connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, kv_tensors))
 
-        # NIXL transfers its own CPU buffer, one vLLM page per block.
+        # NIXL transfers its own CPU buffer; a block of it holds exactly the
+        # packed K and V of that block on every chip, and is the buffer's
+        # memory in block order.
         (buffer,) = connector.connector_worker.host_xfer_buffers.values()
         assert buffer.device.type == "cpu"
         assert buffer.shape[0] == kv_cache_config.num_blocks
-        assert buffer[0].nbytes == spec.page_size_bytes
+        assert buffer[0].nbytes == 2 * CHIPS * k.block_bytes
+        assert kv_transfer._buffer_bytes(buffer).nbytes == buffer.nbytes
     finally:
         connector.shutdown()
 
@@ -379,6 +386,8 @@ def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
 class FakeTTKVTensor:
     """One layer's K or V on device, as (blocks, heads, tokens, dim)."""
 
+    dtype = "bfloat16"
+
     def __init__(self):
         self.blocks = torch.zeros(4, 1, BLOCK_SIZE, 1)
         self.shape = self.blocks.shape
@@ -395,6 +404,106 @@ def fake_tt_kv(monkeypatch):
         cache.blocks[block_id] = values
 
     monkeypatch.setattr(kv_transfer, "_write_block", write_block)
+
+
+CHIPS = 2
+PACKED_BLOCKS = 12
+
+
+class FakePackedKVTensor:
+    """One layer's bfloat8_b K or V: each chip's buffer as bytes."""
+
+    dtype = kv_transfer.ttnn.bfloat8_b
+
+    def __init__(self, heads: int = 1):
+        self.shape = (PACKED_BLOCKS, heads, BLOCK_SIZE, 32)
+        self.block_bytes = heads * (BLOCK_SIZE // 32) * 1088
+        self.chips = [
+            np.zeros(PACKED_BLOCKS * self.block_bytes, dtype=np.uint8)
+            for _ in range(CHIPS)
+        ]
+
+    def device(self):
+        return SimpleNamespace(get_num_devices=lambda: CHIPS)
+
+
+@pytest.fixture
+def fake_chunk_transfers(monkeypatch):
+    """ttnn's chunk transfers, as documented, over ``FakePackedKVTensor``."""
+
+    def to_host(cache, offset, size, count, dst, dst_offset, chunk_step, chip_step):
+        for chip, data in enumerate(cache.chips):
+            for i in range(count):
+                at = dst_offset + i * chunk_step + chip * chip_step
+                dst[at : at + size] = data[offset + i * size :][:size]
+
+    def to_device(src, src_offset, chunk_step, chip_step, cache, offset, size, count):
+        for chip, data in enumerate(cache.chips):
+            for i in range(count):
+                at = src_offset + i * chunk_step + chip * chip_step
+                data[offset + i * size :][:size] = src[at : at + size]
+
+    monkeypatch.setattr(kv_transfer.ttnn, "copy_device_tensor_chunks_to_host", to_host)
+    monkeypatch.setattr(
+        kv_transfer.ttnn, "copy_host_chunks_to_device_tensor", to_device
+    )
+
+
+def test_packed_kv_moves_between_two_servers_as_bytes(fake_chunk_transfers):
+    """bfloat8_b KV crosses the CPU buffers as the device's own bytes."""
+    spec = SimpleNamespace(
+        num_kv_heads=CHIPS, block_size=BLOCK_SIZE, head_size=32, dtype=torch.bfloat16
+    )
+    kv_cache_config = SimpleNamespace(
+        num_blocks=PACKED_BLOCKS,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=LAYER_NAMES)],
+    )
+
+    def server():
+        kv_tensors = {
+            name: (FakePackedKVTensor(), FakePackedKVTensor()) for name in LAYER_NAMES
+        }
+        descriptions = kv_cache_descriptions(kv_cache_config, kv_tensors)
+        # NixlConnector's buffer: tokens before heads in memory, viewed logically.
+        cpu_buffer = {
+            name: torch.zeros(
+                (d.shape[0], d.shape[2], d.shape[1], d.shape[3]), dtype=d.dtype
+            ).permute(0, 2, 1, 3)
+            for name, d in descriptions.items()
+        }
+        return kv_tensors, cpu_buffer, kv_transfer.make_copy_blocks(kv_tensors)
+
+    sent, sender_buffer, sender_copy = server()
+    received, receiver_buffer, receiver_copy = server()
+    rng = np.random.default_rng(0)
+    for k, v in sent.values():
+        for chip in (*k.chips, *v.chips):
+            chip[:] = rng.integers(0, 256, chip.size, dtype=np.uint8)
+
+    # A stretch that counts up, one that counts down, and a block on its own.
+    sent_ids = [0, 1, 2, 9, 8, 7, 5]
+    received_ids = [4, 5, 6, 11, 10, 9, 0]
+    sender_copy(None, sender_buffer, sent_ids, sent_ids, "d2h")
+    for name in LAYER_NAMES:
+        receiver_buffer[name][received_ids] = sender_buffer[name][sent_ids]
+    receiver_copy(receiver_buffer, None, received_ids, received_ids, "h2d")
+
+    for name in LAYER_NAMES:
+        for sent_cache, received_cache in zip(sent[name], received[name]):
+            size = sent_cache.block_bytes
+            for sent_chip, received_chip in zip(sent_cache.chips, received_cache.chips):
+                sent_blocks = sent_chip.reshape(PACKED_BLOCKS, size)
+                received_blocks = received_chip.reshape(PACKED_BLOCKS, size)
+                assert (received_blocks[received_ids] == sent_blocks[sent_ids]).all()
+                # Blocks nothing was sent to stay empty.
+                assert not received_blocks[[1, 2, 3, 7, 8]].any()
+
+
+def test_a_long_stretch_of_blocks_is_copied_in_pieces():
+    ids = list(range(3, 3 + 2 * kv_transfer._MAX_RUN_BLOCKS + 1))
+    runs = list(kv_transfer._runs_of_consecutive_blocks(ids, ids))
+    assert sum(count for _, _, count in runs) == len(ids)
+    assert max(count for _, _, count in runs) == kv_transfer._MAX_RUN_BLOCKS
 
 
 def _model_kv_caches(num_layers: int = 2) -> list:
@@ -442,20 +551,23 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
         k.blocks.normal_()
         v.blocks.normal_()
 
-    sender_copy(sender_descriptions, sender_buffer, [1, 3], [1, 3], "d2h")
+    sent_ids, received_ids = [0, 1, 3], [1, 2, 0]
+    sender_copy(sender_descriptions, sender_buffer, sent_ids, sent_ids, "d2h")
     # The connector moves buffer blocks between servers; block IDs differ there.
     for name in LAYER_NAMES:
-        receiver_buffer[name][[0, 2]] = sender_buffer[name][[1, 3]]
-    receiver_copy(receiver_buffer, receiver_descriptions, [0, 2], [0, 2], "h2d")
+        receiver_buffer[name][received_ids] = sender_buffer[name][sent_ids]
+    receiver_copy(
+        receiver_buffer, receiver_descriptions, received_ids, received_ids, "h2d"
+    )
 
     # The buffer holds K and V side by side, per layer name.
     k1, v1 = sent[1]
     assert torch.equal(sender_buffer[LAYER_NAMES[0]][1, ..., :1], k1.blocks[1])
     assert torch.equal(sender_buffer[LAYER_NAMES[0]][1, ..., 1:], v1.blocks[1])
     for (sent_k, sent_v), (received_k, received_v) in zip(sent, received):
-        assert torch.equal(received_k.blocks[[0, 2]], sent_k.blocks[[1, 3]])
-        assert torch.equal(received_v.blocks[[0, 2]], sent_v.blocks[[1, 3]])
-        assert not received_k.blocks[[1, 3]].any()
+        assert torch.equal(received_k.blocks[received_ids], sent_k.blocks[sent_ids])
+        assert torch.equal(received_v.blocks[received_ids], sent_v.blocks[sent_ids])
+        assert not received_k.blocks[3].any()
 
 
 def test_a_connector_refuses_kv_it_cannot_map_to_layer_names(worker_connector):
