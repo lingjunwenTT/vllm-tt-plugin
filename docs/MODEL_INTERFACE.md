@@ -50,14 +50,13 @@ runs vLLM's KV connector lifecycle; lane-DP and multi-process DP reject the
 option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
 `register_kv_caches` once, after the model adapter allocates KV storage. The
 argument is a dictionary keyed by the layer names in `kv_cache_config`. Each
-value is the entry the adapter allocated for that attention layer, passed
-through unchanged; the plugin promises nothing about its type, layout, dtype,
-or memory placement.
+value is a torch tensor that only describes that layer's KV cache: it has
+vLLM's logical shape `(num_blocks, num_kv_heads, block_size, 2 * head_size)`
+and the spec's dtype, and holds no KV. The KV stays in the ttnn tensors the
+adapter allocated.
 
-Startup raises unless `kv_cache_config` has one layer name per allocated
-entry, each following the `...layers.<idx>...` convention. That requires a
-`get_kv_cache_spec` hook on the model class and a list or tuple from the
-allocator.
+A model class without a `get_kv_cache_spec` hook gets one layer name per
+attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 
 ## Minimum implementation
 

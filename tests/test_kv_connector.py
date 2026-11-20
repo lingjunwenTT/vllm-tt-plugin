@@ -35,6 +35,7 @@ from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
+from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
 
@@ -131,7 +132,7 @@ def worker_connector(monkeypatch, vllm_config):
     return connector
 
 
-def test_the_nixl_connector_starts_on_tt_with_a_cpu_buffer(vllm_config):
+def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
     pytest.importorskip("nixl")
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
         NixlConnector,
@@ -157,7 +158,13 @@ def test_the_nixl_connector_starts_on_tt_with_a_cpu_buffer(vllm_config):
 
     connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
     try:
-        assert connector.connector_worker.use_host_buffer
+        connector.register_kv_caches(kv_cache_descriptions(kv_cache_config))
+
+        # NIXL transfers its own CPU buffer, one vLLM page per block.
+        (buffer,) = connector.connector_worker.host_xfer_buffers.values()
+        assert buffer.device.type == "cpu"
+        assert buffer.shape[0] == kv_cache_config.num_blocks
+        assert buffer[0].nbytes == spec.page_size_bytes
     finally:
         connector.shutdown()
 
@@ -365,24 +372,18 @@ def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
     )
 
 
-def test_the_connector_is_handed_the_models_kv_cache_per_layer(worker_connector):
-    kv_caches = [["k0", "v0"], ["k1", "v1"]]
-    # Group order is vLLM's; the layer index in the name picks the entry.
+def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
     layer_names = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
 
-    _initialize_kv_cache(layer_names, kv_caches)
+    _initialize_kv_cache(layer_names, [["k0", "v0"], ["k1", "v1"]])
 
     assert list(worker_connector.kv_caches) == layer_names
-    assert worker_connector.kv_caches["model.layers.0.self_attn"] is kv_caches[0]
-    assert worker_connector.kv_caches["model.layers.1.self_attn"] is kv_caches[1]
-
-
-def test_a_connector_refuses_a_model_without_per_layer_names(worker_connector):
-    # The default spec names one placeholder layer for a whole model.
-    with pytest.raises(ValueError, match="one kv_cache_config layer name per"):
-        _initialize_kv_cache(["foo"], [["k0", "v0"], ["k1", "v1"]])
-
-    assert worker_connector.kv_caches is None
+    for description in worker_connector.kv_caches.values():
+        # (num_blocks, num_kv_heads, block_size, K and V of head_size 1)
+        assert description.shape == (4, 1, BLOCK_SIZE, 2)
+        assert description.dtype == torch.float32
+        # One element stands in for the whole shape.
+        assert description.untyped_storage().nbytes() == 4
 
 
 def _run_step(scheduler, runner) -> SchedulerOutput:
