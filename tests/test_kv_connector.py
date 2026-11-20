@@ -388,13 +388,15 @@ class FakeTTKVTensor:
 def fake_tt_kv(monkeypatch):
     """Block reads and writes land on ``FakeTTKVTensor`` instead of a device."""
     monkeypatch.setattr(
-        kv_transfer, "_read_block", lambda cache, block_id: cache.blocks[block_id]
+        kv_transfer,
+        "_read_blocks",
+        lambda cache, first, count: cache.blocks[first : first + count],
     )
 
-    def write_block(cache, block_id, values):
-        cache.blocks[block_id] = values
+    def write_blocks(cache, first, values):
+        cache.blocks[first : first + len(values)] = values
 
-    monkeypatch.setattr(kv_transfer, "_write_block", write_block)
+    monkeypatch.setattr(kv_transfer, "_write_blocks", write_blocks)
 
 
 def _model_kv_caches(num_layers: int = 2) -> list:
@@ -442,20 +444,24 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
         k.blocks.normal_()
         v.blocks.normal_()
 
-    sender_copy(sender_descriptions, sender_buffer, [1, 3], [1, 3], "d2h")
+    # Blocks 0 and 1 are consecutive and copied as one stretch; 3 stands alone.
+    sent_ids, received_ids = [0, 1, 3], [1, 2, 0]
+    sender_copy(sender_descriptions, sender_buffer, sent_ids, sent_ids, "d2h")
     # The connector moves buffer blocks between servers; block IDs differ there.
     for name in LAYER_NAMES:
-        receiver_buffer[name][[0, 2]] = sender_buffer[name][[1, 3]]
-    receiver_copy(receiver_buffer, receiver_descriptions, [0, 2], [0, 2], "h2d")
+        receiver_buffer[name][received_ids] = sender_buffer[name][sent_ids]
+    receiver_copy(
+        receiver_buffer, receiver_descriptions, received_ids, received_ids, "h2d"
+    )
 
     # The buffer holds K and V side by side, per layer name.
     k1, v1 = sent[1]
     assert torch.equal(sender_buffer[LAYER_NAMES[0]][1, ..., :1], k1.blocks[1])
     assert torch.equal(sender_buffer[LAYER_NAMES[0]][1, ..., 1:], v1.blocks[1])
     for (sent_k, sent_v), (received_k, received_v) in zip(sent, received):
-        assert torch.equal(received_k.blocks[[0, 2]], sent_k.blocks[[1, 3]])
-        assert torch.equal(received_v.blocks[[0, 2]], sent_v.blocks[[1, 3]])
-        assert not received_k.blocks[[1, 3]].any()
+        assert torch.equal(received_k.blocks[received_ids], sent_k.blocks[sent_ids])
+        assert torch.equal(received_v.blocks[received_ids], sent_v.blocks[sent_ids])
+        assert not received_k.blocks[3].any()
 
 
 def test_a_connector_refuses_kv_it_cannot_map_to_layer_names(worker_connector):

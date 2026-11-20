@@ -3,6 +3,7 @@
 
 """What ``TTModelRunner`` gives a worker-side KV connector."""
 
+import numpy as np
 import torch
 import ttnn
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
@@ -112,16 +113,93 @@ def make_copy_blocks(kv_tensors: dict[str, tuple]) -> CopyBlocksOp:
     """
 
     def copy_blocks(src, dst, src_block_ids, dst_block_ids, direction) -> None:
+        runs = list(_runs_of_consecutive_blocks(src_block_ids, dst_block_ids))
         for name, (k, v) in kv_tensors.items():
             head_dim = k.shape[-1]
-            for src_id, dst_id in zip(src_block_ids, dst_block_ids):
+            for src_first, dst_first, count in runs:
                 if direction == "d2h":
-                    dst[name][dst_id] = torch.cat(
-                        [_read_block(k, src_id), _read_block(v, src_id)], dim=-1
+                    dst[name][dst_first : dst_first + count] = torch.cat(
+                        [
+                            _read_blocks(k, src_first, count),
+                            _read_blocks(v, src_first, count),
+                        ],
+                        dim=-1,
                     )
                 else:
-                    block = src[name][src_id].float()
-                    _write_block(k, dst_id, block[..., :head_dim])
-                    _write_block(v, dst_id, block[..., head_dim:])
+                    blocks = src[name][src_first : src_first + count].float()
+                    _write_blocks(k, dst_first, blocks[..., :head_dim])
+                    _write_blocks(v, dst_first, blocks[..., head_dim:])
 
     return copy_blocks
+
+
+def _runs_of_consecutive_blocks(src_block_ids: list[int], dst_block_ids: list[int]):
+    """Yield ``(first source, first destination, count)`` for each stretch of
+    the copy whose source and destination block IDs both count up by one."""
+    first = 0
+    for i in range(1, len(src_block_ids) + 1):
+        if (
+            i == len(src_block_ids)
+            or src_block_ids[i] != src_block_ids[i - 1] + 1
+            or dst_block_ids[i] != dst_block_ids[i - 1] + 1
+        ):
+            yield src_block_ids[first], dst_block_ids[first], i - first
+            first = i
+
+
+# A 32x32 tile of bfloat8_b: one byte per value and a shared exponent per row
+# of 16 values.
+_BFLOAT8_TILE_BYTES = 1088
+
+
+def _bfloat8_block_bytes(cache) -> int:
+    """Bytes one block takes in each chip's buffer of a bfloat8_b KV cache.
+
+    A paged KV cache is tiled block by block, so a block is one byte range.
+    """
+    _, heads, block_size, head_dim = tuple(cache.shape)
+    return heads * (block_size // 32) * (head_dim // 32) * _BFLOAT8_TILE_BYTES
+
+
+def _read_blocks(cache, first: int, count: int) -> torch.Tensor:
+    """``count`` consecutive blocks as ``(count, heads, block_size, head_dim)``."""
+    if cache.dtype != ttnn.bfloat8_b:
+        return torch.stack([_read_block(cache, first + i) for i in range(count)])
+    # The blocks' packed tiles are read as bytes and unpacked on the host; no
+    # program runs on the device.
+    block_bytes = _bfloat8_block_bytes(cache)
+    per_chip_shape = [count, *tuple(cache.shape)[1:]]
+    per_chip = [
+        ttnn.to_torch(
+            ttnn.experimental.disaggregation.tensor_from_bfp8_bytes(
+                chip_bytes, per_chip_shape
+            )
+        )
+        for chip_bytes in ttnn.copy_device_tensor_region_to_host(
+            cache, first * block_bytes, count * block_bytes
+        )
+    ]
+    return torch.cat(per_chip, dim=1)
+
+
+def _write_blocks(cache, first: int, values: torch.Tensor) -> None:
+    """Write ``(count, heads, block_size, head_dim)`` into consecutive blocks."""
+    if cache.dtype != ttnn.bfloat8_b:
+        for i, block in enumerate(values):
+            _write_block(cache, first + i, block)
+        return
+    # Each chip's share of the heads is packed into tiles on the host and
+    # written as bytes over the blocks.
+    per_chip_bytes = [
+        np.from_dlpack(
+            ttnn.from_torch(
+                per_chip.contiguous(), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT
+            )
+            .host_buffer()
+            .get_shard(ttnn.MeshCoordinate(0, 0))
+        ).tobytes()
+        for per_chip in values.chunk(cache.device().get_num_devices(), dim=1)
+    ]
+    ttnn.copy_host_to_device_tensor_region(
+        per_chip_bytes, cache, first * _bfloat8_block_bytes(cache)
+    )
