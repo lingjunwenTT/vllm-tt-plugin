@@ -9,15 +9,46 @@ import ttnn
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+# A 32x32 tile of bfloat8_b: one byte per value and a shared exponent per row
+# of 16 values.
+_BFLOAT8_TILE_BYTES = 1088
 
-def kv_cache_descriptions(kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+# Longer stretches are copied in pieces of this many blocks. Measured on a
+# 1x2 Blackhole mesh, the rate falls from about 9.5 GB/s to under 7 GB/s
+# between 128 and 512 blocks in one device transfer.
+_MAX_RUN_BLOCKS = 64
+
+
+def _bfloat8_block_bytes(cache) -> int:
+    """Bytes one block takes in each chip's buffer of a bfloat8_b KV cache.
+
+    A paged KV cache is tiled block by block, so a block is one byte range.
+    """
+    _, heads, block_size, head_dim = tuple(cache.shape)
+    return heads * (block_size // 32) * (head_dim // 32) * _BFLOAT8_TILE_BYTES
+
+
+def kv_cache_descriptions(
+    kv_cache_config: KVCacheConfig, kv_tensors: dict[str, tuple]
+) -> dict[str, torch.Tensor]:
     """A torch tensor per layer name that describes the layer's KV cache.
 
-    Each has vLLM's logical KV shape ``(num_blocks, num_kv_heads, block_size,
-    2 * head_size)``, K and V side by side in the last dimension, and the
-    spec's dtype. No KV is behind it: it is one element expanded to that
-    shape. The KV itself is in the model's ttnn tensors, which a connector
-    written against torch cannot read.
+    A connector sizes its CPU buffer from these. No KV is behind one: it is
+    one element expanded to the shape. The KV itself is in the model's ttnn
+    tensors, which a connector written against torch cannot read.
+
+    A layer whose cache is bfloat8_b is described as bytes: ``(num_blocks,
+    num_kv_heads, block_size, n)`` uint8, where a block's bytes are exactly
+    the packed tiles of its K and V on every chip. ``make_copy_blocks`` moves
+    those tiles unchanged, so a buffer block is only meaningful to a server
+    whose cache is also bfloat8_b with the same KV heads in total, head size
+    and block size. The number of chips may differ: each chip holds an equal
+    share of the heads in chip order, so the chips' tiles joined in that
+    order are the tiles one chip would hold.
+
+    Any other layer has vLLM's logical KV shape ``(num_blocks, num_kv_heads,
+    block_size, 2 * head_size)``, K and V side by side in the last dimension,
+    and the spec's dtype.
     """
     descriptions = {}
     for group in kv_cache_config.kv_cache_groups:
@@ -25,13 +56,28 @@ def kv_cache_descriptions(kv_cache_config: KVCacheConfig) -> dict[str, torch.Ten
         per_layer_specs = getattr(group.kv_cache_spec, "kv_cache_specs", None)
         for name in group.layer_names:
             spec = per_layer_specs[name] if per_layer_specs else group.kv_cache_spec
+            k, _ = kv_tensors[name]
+            if k.dtype == ttnn.bfloat8_b:
+                block_bytes = 2 * k.device().get_num_devices() * _bfloat8_block_bytes(k)
+                last, remainder = divmod(
+                    block_bytes, spec.num_kv_heads * spec.block_size
+                )
+                if remainder:
+                    raise ValueError(
+                        f"Layer {name}: a packed KV block of {block_bytes} bytes "
+                        f"does not divide into {spec.num_kv_heads} heads of "
+                        f"{spec.block_size} tokens."
+                    )
+                dtype = torch.uint8
+            else:
+                last, dtype = 2 * spec.head_size, spec.dtype
             shape = (
                 kv_cache_config.num_blocks,
                 spec.num_kv_heads,
                 spec.block_size,
-                2 * spec.head_size,
+                last,
             )
-            descriptions[name] = torch.empty(1, dtype=spec.dtype).expand(shape)
+            descriptions[name] = torch.empty(1, dtype=dtype).expand(shape)
     return descriptions
 
 
@@ -113,93 +159,97 @@ def make_copy_blocks(kv_tensors: dict[str, tuple]) -> CopyBlocksOp:
     """
 
     def copy_blocks(src, dst, src_block_ids, dst_block_ids, direction) -> None:
+        to_host = direction == "d2h"
+        buffers = dst if to_host else src
         runs = list(_runs_of_consecutive_blocks(src_block_ids, dst_block_ids))
         for name, (k, v) in kv_tensors.items():
-            head_dim = k.shape[-1]
-            for src_first, dst_first, count in runs:
-                if direction == "d2h":
-                    dst[name][dst_first : dst_first + count] = torch.cat(
-                        [
-                            _read_blocks(k, src_first, count),
-                            _read_blocks(v, src_first, count),
-                        ],
-                        dim=-1,
+            if k.dtype == ttnn.bfloat8_b:
+                _copy_packed_blocks(k, v, _buffer_bytes(buffers[name]), runs, to_host)
+            elif to_host:
+                for src_id, dst_id in zip(src_block_ids, dst_block_ids):
+                    dst[name][dst_id] = torch.cat(
+                        [_read_block(k, src_id), _read_block(v, src_id)], dim=-1
                     )
-                else:
-                    blocks = src[name][src_first : src_first + count].float()
-                    _write_blocks(k, dst_first, blocks[..., :head_dim])
-                    _write_blocks(v, dst_first, blocks[..., head_dim:])
+            else:
+                head_dim = k.shape[-1]
+                for src_id, dst_id in zip(src_block_ids, dst_block_ids):
+                    block = src[name][src_id].float()
+                    _write_block(k, dst_id, block[..., :head_dim])
+                    _write_block(v, dst_id, block[..., head_dim:])
 
     return copy_blocks
 
 
-def _runs_of_consecutive_blocks(src_block_ids: list[int], dst_block_ids: list[int]):
-    """Yield ``(first source, first destination, count)`` for each stretch of
-    the copy whose source and destination block IDs both count up by one."""
-    first = 0
-    for i in range(1, len(src_block_ids) + 1):
-        if (
-            i == len(src_block_ids)
-            or src_block_ids[i] != src_block_ids[i - 1] + 1
-            or dst_block_ids[i] != dst_block_ids[i - 1] + 1
-        ):
-            yield src_block_ids[first], dst_block_ids[first], i - first
-            first = i
+def _buffer_bytes(buffer: torch.Tensor) -> np.ndarray:
+    """A connector's uint8 buffer for one layer as flat bytes, block after block.
 
-
-# A 32x32 tile of bfloat8_b: one byte per value and a shared exponent per row
-# of 16 values.
-_BFLOAT8_TILE_BYTES = 1088
-
-
-def _bfloat8_block_bytes(cache) -> int:
-    """Bytes one block takes in each chip's buffer of a bfloat8_b KV cache.
-
-    A paged KV cache is tiled block by block, so a block is one byte range.
+    NixlConnector allocates ``(blocks, tokens, heads, n)`` and hands out the
+    view ``(blocks, heads, tokens, n)``. ``view`` raises if neither is the
+    buffer's memory order.
     """
-    _, heads, block_size, head_dim = tuple(cache.shape)
-    return heads * (block_size // 32) * (head_dim // 32) * _BFLOAT8_TILE_BYTES
+    if not buffer.is_contiguous():
+        buffer = buffer.permute(0, 2, 1, 3)
+    return buffer.view(-1).numpy()
 
 
-def _read_blocks(cache, first: int, count: int) -> torch.Tensor:
-    """``count`` consecutive blocks as ``(count, heads, block_size, head_dim)``."""
-    if cache.dtype != ttnn.bfloat8_b:
-        return torch.stack([_read_block(cache, first + i) for i in range(count)])
-    # The blocks' packed tiles are read as bytes and unpacked on the host; no
-    # program runs on the device.
-    block_bytes = _bfloat8_block_bytes(cache)
-    per_chip_shape = [count, *tuple(cache.shape)[1:]]
-    per_chip = [
-        ttnn.to_torch(
-            ttnn.experimental.disaggregation.tensor_from_bfp8_bytes(
-                chip_bytes, per_chip_shape
-            )
-        )
-        for chip_bytes in ttnn.copy_device_tensor_region_to_host(
-            cache, first * block_bytes, count * block_bytes
-        )
-    ]
-    return torch.cat(per_chip, dim=1)
+def _copy_packed_blocks(k, v, host: np.ndarray, runs, to_host: bool) -> None:
+    """Move stretches of blocks of one layer's bfloat8_b K and V as packed bytes.
+
+    A buffer block holds K's tiles from each chip in chip order, then V's. No
+    program runs on the device and nothing is converted on the host.
+    """
+    chip_bytes = _bfloat8_block_bytes(k)
+    cache_bytes = k.device().get_num_devices() * chip_bytes
+    block_bytes = 2 * cache_bytes
+    for src_first, dst_first, count in runs:
+        for i, cache in enumerate((k, v)):
+            if to_host:
+                ttnn.copy_device_tensor_chunks_to_host(
+                    cache,
+                    src_first * chip_bytes,
+                    chip_bytes,
+                    count,
+                    host,
+                    dst_first * block_bytes + i * cache_bytes,
+                    block_bytes,
+                    chip_bytes,
+                )
+            else:
+                ttnn.copy_host_chunks_to_device_tensor(
+                    host,
+                    src_first * block_bytes + i * cache_bytes,
+                    block_bytes,
+                    chip_bytes,
+                    cache,
+                    dst_first * chip_bytes,
+                    chip_bytes,
+                    count,
+                )
 
 
-def _write_blocks(cache, first: int, values: torch.Tensor) -> None:
-    """Write ``(count, heads, block_size, head_dim)`` into consecutive blocks."""
-    if cache.dtype != ttnn.bfloat8_b:
-        for i, block in enumerate(values):
-            _write_block(cache, first + i, block)
-        return
-    # Each chip's share of the heads is packed into tiles on the host and
-    # written as bytes over the blocks.
-    per_chip_bytes = [
-        np.from_dlpack(
-            ttnn.from_torch(
-                per_chip.contiguous(), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT
-            )
-            .host_buffer()
-            .get_shard(ttnn.MeshCoordinate(0, 0))
-        ).tobytes()
-        for per_chip in values.chunk(cache.device().get_num_devices(), dim=1)
-    ]
-    ttnn.copy_host_to_device_tensor_region(
-        per_chip_bytes, cache, first * _bfloat8_block_bytes(cache)
-    )
+def _runs_of_consecutive_blocks(src_block_ids: list[int], dst_block_ids: list[int]):
+    """Yield ``(lowest source, lowest destination, count)`` for each stretch of
+    the copy whose source and destination block IDs both count up by one, or
+    both count down by one, cut at ``_MAX_RUN_BLOCKS``.
+
+    vLLM hands a request the blocks an earlier one freed in descending order,
+    so a stretch that counts down is as common as one that counts up. Either
+    way it is the same set of block pairs, named from its lowest IDs.
+    """
+    first, step = 0, 0
+    for i in range(1, len(src_block_ids) + 1):
+        this_step = 0
+        if i < len(src_block_ids) and i - first < _MAX_RUN_BLOCKS:
+            this_step = src_block_ids[i] - src_block_ids[i - 1]
+            if (
+                this_step not in (1, -1)
+                or dst_block_ids[i] - dst_block_ids[i - 1] != this_step
+                or step not in (0, this_step)
+            ):
+                this_step = 0
+        if this_step:
+            step = this_step
+            continue
+        lowest = first if step >= 0 else i - 1
+        yield src_block_ids[lowest], dst_block_ids[lowest], i - first
+        first, step = i, 0
