@@ -754,20 +754,19 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
-            connector.register_kv_caches(kv_cache_descriptions(kv_cache_config))
-            # Only a connector that stages KV through a CPU buffer keeps this.
-            connector.set_host_xfer_buffer_ops(
-                make_copy_blocks(
-                    kv_tensors_by_layer_name(
-                        self.kv_caches,
-                        {
-                            name: _parse_layer_index(name)
-                            for group in kv_cache_groups
-                            for name in group.layer_names
-                        },
-                    )
-                )
+            kv_tensors = kv_tensors_by_layer_name(
+                self.kv_caches,
+                {
+                    name: _parse_layer_index(name)
+                    for group in kv_cache_groups
+                    for name in group.layer_names
+                },
             )
+            connector.register_kv_caches(
+                kv_cache_descriptions(kv_cache_config, kv_tensors)
+            )
+            # Only a connector that stages KV through a CPU buffer keeps this.
+            connector.set_host_xfer_buffer_ops(make_copy_blocks(kv_tensors))
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
