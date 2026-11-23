@@ -58,6 +58,15 @@ adapter allocated.
 A model class without a `get_kv_cache_spec` hook gets one layer name per
 attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 
+The runner then calls `set_host_xfer_buffer_ops` with the function that copies
+KV blocks between the adapter's ttnn tensors and a CPU buffer shaped like
+those descriptions. A connector that stages KV through such a buffer, like
+`NixlConnector` with `"kv_buffer_device": "cpu"`, moves KV with it. Startup
+raises unless the allocator returned one `[k, v]` pair per layer name, each
+name following the `...layers.<idx>...` convention. On a mesh of several chips
+the copy takes each chip's tensor to hold an equal share of the KV heads, in
+chip order.
+
 ## Minimum implementation
 
 An ordinary text adapter needs `initialize_vllm_model`, `prefill_forward`,

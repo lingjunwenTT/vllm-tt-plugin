@@ -34,6 +34,7 @@ from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
+from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
@@ -71,6 +72,9 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
 
     def register_kv_caches(self, kv_caches):
         self.kv_caches = kv_caches
+
+    def set_host_xfer_buffer_ops(self, copy_operation):
+        self.copy_blocks = copy_operation
 
     def handle_preemptions(self, kv_connector_metadata):
         self.calls.append("handle_preemptions")
@@ -372,10 +376,38 @@ def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
     )
 
 
-def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
-    layer_names = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
+class FakeTTKVTensor:
+    """One layer's K or V on device, as (blocks, heads, tokens, dim)."""
 
-    _initialize_kv_cache(layer_names, [["k0", "v0"], ["k1", "v1"]])
+    def __init__(self):
+        self.blocks = torch.zeros(4, 1, BLOCK_SIZE, 1)
+        self.shape = self.blocks.shape
+
+
+@pytest.fixture
+def fake_tt_kv(monkeypatch):
+    """Block reads and writes land on ``FakeTTKVTensor`` instead of a device."""
+    monkeypatch.setattr(
+        kv_transfer, "_read_block", lambda cache, block_id: cache.blocks[block_id]
+    )
+
+    def write_block(cache, block_id, values):
+        cache.blocks[block_id] = values
+
+    monkeypatch.setattr(kv_transfer, "_write_block", write_block)
+
+
+def _model_kv_caches(num_layers: int = 2) -> list:
+    return [[FakeTTKVTensor(), FakeTTKVTensor()] for _ in range(num_layers)]
+
+
+LAYER_NAMES = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
+
+
+def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
+    layer_names = LAYER_NAMES
+
+    _initialize_kv_cache(layer_names, _model_kv_caches())
 
     assert list(worker_connector.kv_caches) == layer_names
     for description in worker_connector.kv_caches.values():
@@ -384,6 +416,51 @@ def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connecto
         assert description.dtype == torch.float32
         # One element stands in for the whole shape.
         assert description.untyped_storage().nbytes() == 4
+
+
+@pytest.mark.parametrize("one_list_per_submesh", [False, True])
+def test_kv_moves_between_two_servers_through_their_cpu_buffers(
+    worker_connector, fake_tt_kv, one_list_per_submesh
+):
+    """The copy a host-staging connector is given, on a sender and a receiver."""
+
+    def server():
+        kv_caches = _model_kv_caches()
+        _initialize_kv_cache(
+            LAYER_NAMES, [kv_caches] if one_list_per_submesh else kv_caches
+        )
+        descriptions = worker_connector.kv_caches
+        cpu_buffer = {
+            name: torch.zeros(description.shape, dtype=description.dtype)
+            for name, description in descriptions.items()
+        }
+        return kv_caches, descriptions, cpu_buffer, worker_connector.copy_blocks
+
+    sent, sender_descriptions, sender_buffer, sender_copy = server()
+    received, receiver_descriptions, receiver_buffer, receiver_copy = server()
+    for k, v in sent:
+        k.blocks.normal_()
+        v.blocks.normal_()
+
+    sender_copy(sender_descriptions, sender_buffer, [1, 3], [1, 3], "d2h")
+    # The connector moves buffer blocks between servers; block IDs differ there.
+    for name in LAYER_NAMES:
+        receiver_buffer[name][[0, 2]] = sender_buffer[name][[1, 3]]
+    receiver_copy(receiver_buffer, receiver_descriptions, [0, 2], [0, 2], "h2d")
+
+    # The buffer holds K and V side by side, per layer name.
+    k1, v1 = sent[1]
+    assert torch.equal(sender_buffer[LAYER_NAMES[0]][1, ..., :1], k1.blocks[1])
+    assert torch.equal(sender_buffer[LAYER_NAMES[0]][1, ..., 1:], v1.blocks[1])
+    for (sent_k, sent_v), (received_k, received_v) in zip(sent, received):
+        assert torch.equal(received_k.blocks[[0, 2]], sent_k.blocks[[1, 3]])
+        assert torch.equal(received_v.blocks[[0, 2]], sent_v.blocks[[1, 3]])
+        assert not received_k.blocks[[1, 3]].any()
+
+
+def test_a_connector_refuses_kv_it_cannot_map_to_layer_names(worker_connector):
+    with pytest.raises(ValueError, match="one \\[k, v\\] KV cache entry per"):
+        _initialize_kv_cache(LAYER_NAMES, _model_kv_caches(num_layers=3))
 
 
 def _run_step(scheduler, runner) -> SchedulerOutput:
