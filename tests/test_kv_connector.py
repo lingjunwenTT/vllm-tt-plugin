@@ -344,12 +344,17 @@ def _scheduler_with_running_decode():
     return scheduler
 
 
-def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
+def _initialize_kv_cache(
+    layer_names: list[str], kv_caches: list, kv_buffer_device: str = "cpu"
+) -> None:
     """``TTModelRunner.initialize_kv_cache`` over a model holding ``kv_caches``."""
     spec = FullAttentionSpec(
         block_size=BLOCK_SIZE, num_kv_heads=CHIPS, head_size=32, dtype=torch.float32
     )
     runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
+        ),
         tt_max_batch_size=2,
         model_config=SimpleNamespace(max_model_len=BLOCK_SIZE),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=BLOCK_SIZE),
@@ -516,6 +521,27 @@ class FakeDramKVTensor:
         self.address = address
         self.device_ids = list(device_ids)
 
+    def tiles_in(self, card_dram: dict) -> np.ndarray:
+        """This tensor's tiles in ``card_dram``, a byte array per (card, bank),
+        found the way ttnn finds them: tile ``i`` is in bank ``i % BANKS``,
+        ``i // BANKS`` tiles past the buffer address."""
+        (card,) = self.device_ids
+        num_tiles = PACKED_BLOCKS * self.shape[1] * 2 * 4
+        per_bank = [
+            card_dram[card, bank][self.address :][: num_tiles // BANKS * 1088]
+            for bank in range(BANKS)
+        ]
+        return np.stack([b.reshape(-1, 1088) for b in per_bank], axis=1)
+
+    def fill(self, card_dram: dict, rng) -> None:
+        """Write random tiles where ``tiles_in`` reads them."""
+        (card,) = self.device_ids
+        size = self.tiles_in(card_dram).size // BANKS
+        for bank in range(BANKS):
+            card_dram[card, bank][self.address :][:size] = rng.integers(
+                0, 256, size, dtype=np.uint8
+            )
+
     def buffer_address(self):
         return self.address
 
@@ -577,6 +603,60 @@ def test_kv_that_nixl_cannot_address_in_dram_is_refused(
     change(k, fake_dram_banks)
     with pytest.raises(ValueError, match=message):
         kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
+
+
+def test_kv_moves_between_two_servers_card_dram(worker_connector, fake_dram_banks):
+    """What NIXL is asked to move, block for block and region for region, is
+    the block's KV in the sender's tensors and in the receiver's."""
+    card_dram = {
+        (card, bank): np.zeros(0x80000, dtype=np.uint8)
+        for card in (0, 1)
+        for bank in range(BANKS)
+    }
+
+    def server(card: int, first_address: int):
+        kv_caches = [
+            [
+                FakeDramKVTensor(first_address + 0x20000 * (2 * layer + i), [card])
+                for i in range(2)
+            ]
+            for layer in range(len(LAYER_NAMES))
+        ]
+        _initialize_kv_cache(LAYER_NAMES, kv_caches, kv_buffer_device="tt")
+        return kv_caches, worker_connector.kv_caches
+
+    sent, sender_layout = server(card=0, first_address=0x1000)
+    received, receiver_layout = server(card=1, first_address=0x3000)
+    rng = np.random.default_rng(0)
+    for cache in (cache for layer in sent for cache in layer):
+        cache.fill(card_dram, rng)
+
+    sent_ids = [0, 1, 2, 9, 8, 7, 5]
+    received_ids = [4, 5, 6, 11, 10, 9, 0]
+    # NIXL: the bytes of block ``b`` of a region are at ``addr + b * block_bytes``.
+    for name in LAYER_NAMES:
+        for src, dst in zip(sender_layout.regions[name], receiver_layout.regions[name]):
+            assert src.block_bytes == dst.block_bytes
+            src_bank = card_dram[src.card, src.addr >> 32]
+            dst_bank = card_dram[dst.card, dst.addr >> 32]
+            for sent_id, received_id in zip(sent_ids, received_ids):
+                src_at = (src.addr & 0xFFFFFFFF) + sent_id * src.block_bytes
+                dst_at = (dst.addr & 0xFFFFFFFF) + received_id * dst.block_bytes
+                dst_bank[dst_at:][: dst.block_bytes] = src_bank[src_at:][
+                    : src.block_bytes
+                ]
+
+    for sent_layer, received_layer in zip(sent, received):
+        for sent_cache, received_cache in zip(sent_layer, received_layer):
+            sent_blocks = sent_cache.tiles_in(card_dram).reshape(PACKED_BLOCKS, -1)
+            received_blocks = received_cache.tiles_in(card_dram).reshape(
+                PACKED_BLOCKS, -1
+            )
+            assert sent_blocks[sent_ids].any(axis=1).all()
+            assert (received_blocks[received_ids] == sent_blocks[sent_ids]).all()
+            assert not received_blocks[[1, 2, 3, 7, 8]].any()
+    # No CPU buffer copy is installed.
+    assert not hasattr(worker_connector, "copy_blocks")
 
 
 class RecordingNixl:

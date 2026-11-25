@@ -76,6 +76,7 @@ from vllm_tt_plugin.input_batch import (
 )
 from vllm_tt_plugin.kv_transfer import (
     kv_cache_descriptions,
+    kv_dram_layout,
     kv_tensors_by_layer_name,
     make_copy_blocks,
 )
@@ -776,11 +777,17 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     for name in group.layer_names
                 },
             )
-            connector.register_kv_caches(
-                kv_cache_descriptions(kv_cache_config, kv_tensors)
-            )
-            # Only a connector that stages KV through a CPU buffer keeps this.
-            connector.set_host_xfer_buffer_ops(make_copy_blocks(kv_tensors))
+            if self.vllm_config.kv_transfer_config.kv_buffer_device == "tt":
+                # The connector transfers the card's DRAM itself.
+                connector.register_kv_caches(
+                    kv_dram_layout(kv_tensors, kv_cache_config.num_blocks)
+                )
+            else:
+                connector.register_kv_caches(
+                    kv_cache_descriptions(kv_cache_config, kv_tensors)
+                )
+                # Only a connector that stages KV through a CPU buffer keeps this.
+                connector.set_host_xfer_buffer_ops(make_copy_blocks(kv_tensors))
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
