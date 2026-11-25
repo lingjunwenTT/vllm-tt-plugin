@@ -353,7 +353,10 @@ def _initialize_kv_cache(
     )
     runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
-            kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
+            kv_transfer_config=SimpleNamespace(
+                kv_buffer_device=kv_buffer_device,
+                get_from_extra_config=lambda _key, default: default,
+            )
         ),
         tt_max_batch_size=2,
         model_config=SimpleNamespace(max_model_len=BLOCK_SIZE),
@@ -585,7 +588,7 @@ def test_a_layers_kv_is_a_dram_region_per_cache_and_bank(fake_dram_banks):
 
     block_bytes = 4 * 1088
     assert layout.regions["layers.0"] == [
-        kv_transfer.DramRegion(0, bank << 32 | cache.address, block_bytes)
+        kv_transfer.DramRegion(0, bank << 32 | cache.address, block_bytes, block_bytes)
         for cache in (k, v)
         for bank in range(BANKS)
     ]
@@ -615,7 +618,7 @@ def test_a_mesh_has_dram_regions_on_each_chips_card(fake_dram_banks):
     layout = kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
 
     assert layout.regions["layers.0"] == [
-        kv_transfer.DramRegion(card, bank << 32 | cache.address, 4 * 1088)
+        kv_transfer.DramRegion(card, bank << 32 | cache.address, 4 * 1088, 4 * 1088)
         for cache in (k, v)
         for card in (2, 5)
         for bank in range(BANKS)
@@ -678,15 +681,15 @@ def test_kv_moves_between_two_servers_card_dram(worker_connector, fake_dram_bank
 
     sent_ids = [0, 1, 2, 9, 8, 7, 5]
     received_ids = [4, 5, 6, 11, 10, 9, 0]
-    # NIXL: the bytes of block ``b`` of a region are at ``addr + b * block_bytes``.
+    # NIXL: the bytes of block ``b`` of a region are at ``addr + b * block_stride``.
     for name in LAYER_NAMES:
         for src, dst in zip(sender_layout.regions[name], receiver_layout.regions[name]):
             assert src.block_bytes == dst.block_bytes
             src_bank = card_dram[src.card, src.addr >> 32]
             dst_bank = card_dram[dst.card, dst.addr >> 32]
             for sent_id, received_id in zip(sent_ids, received_ids):
-                src_at = (src.addr & 0xFFFFFFFF) + sent_id * src.block_bytes
-                dst_at = (dst.addr & 0xFFFFFFFF) + received_id * dst.block_bytes
+                src_at = (src.addr & 0xFFFFFFFF) + sent_id * src.block_stride
+                dst_at = (dst.addr & 0xFFFFFFFF) + received_id * dst.block_stride
                 dst_bank[dst_at:][: dst.block_bytes] = src_bank[src_at:][
                     : src.block_bytes
                 ]
@@ -702,6 +705,54 @@ def test_kv_moves_between_two_servers_card_dram(worker_connector, fake_dram_bank
             assert not received_blocks[[1, 2, 3, 7, 8]].any()
     # No CPU buffer copy is installed.
     assert not hasattr(worker_connector, "copy_blocks")
+
+
+def test_one_chip_sends_kv_to_two_chips(fake_dram_banks):
+    """A one-chip server that lists its KV in two parts names, region for
+    region, what each chip of a two-chip server holds."""
+    tile_bytes = 1088
+    one_chip = FakeDramKVTensor(4 * tile_bytes, device_ids=[0])
+    one_chip.shape = (PACKED_BLOCKS, 8, 64, 128)
+    two_chips = FakeDramKVTensor(12 * tile_bytes, device_ids=[1, 2])  # 4 heads each
+    sender = kv_transfer.kv_dram_layout({"l": (one_chip,)}, PACKED_BLOCKS, parts=2)
+    receiver = kv_transfer.kv_dram_layout({"l": (two_chips,)}, PACKED_BLOCKS)
+
+    # A block of the one-chip cache is 64 tiles, heads 0 to 7 in order. ttnn
+    # deals them over the banks; number each tile so it can be followed.
+    # Card memory here is one number per tile.
+    block = 5
+    card_dram = {
+        (card, bank): np.zeros(256, dtype=np.int64)
+        for card in (0, 1, 2)
+        for bank in range(BANKS)
+    }
+    for tile in range(64):
+        card_dram[0, tile % BANKS][4 + block * 8 + tile // BANKS] = 1000 + tile
+
+    def tile_at(region, at):
+        bank, address = region.addr >> 32, region.addr & 0xFFFFFFFF
+        return card_dram[region.card, bank], (address + at) // tile_bytes
+
+    assert len(sender.regions["l"]) == len(receiver.regions["l"]) == 2 * BANKS
+    for src, dst in zip(sender.regions["l"], receiver.regions["l"]):
+        assert src.block_bytes == dst.block_bytes == 4 * tile_bytes
+        for offset in range(0, src.block_bytes, tile_bytes):
+            src_bank, src_tile = tile_at(src, block * src.block_stride + offset)
+            dst_bank, dst_tile = tile_at(dst, block * dst.block_stride + offset)
+            dst_bank[dst_tile] = src_bank[src_tile]
+
+    # Each chip of the receiver now holds its 4 heads of the block: 32 tiles,
+    # dealt over its banks the same way.
+    for chip, card in enumerate((1, 2)):
+        for tile in range(32):
+            in_bank = 12 + block * 4 + tile // BANKS
+            assert card_dram[card, tile % BANKS][in_bank] == 1000 + 32 * chip + tile
+
+
+def test_kv_that_cannot_be_listed_in_the_parts_asked_for_is_refused(fake_dram_banks):
+    k = FakeDramKVTensor(0x1000, device_ids=[1, 2])
+    with pytest.raises(ValueError, match="2 chip.*cannot be listed in 3 equal parts"):
+        kv_transfer.kv_dram_layout({"l": (k,)}, PACKED_BLOCKS, parts=3)
 
 
 class RecordingNixl:

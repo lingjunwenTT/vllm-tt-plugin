@@ -79,8 +79,12 @@ per layer name, K's byte range in each bank of each chip and then V's, and
 each bank to register. A block is the same number of bytes in every range.
 Startup raises unless every cache is `bfloat8_b`, is on chips with all 8 banks
 in use, and has blocks whose tiles divide evenly over the banks. Both servers
-of a transfer need the same number of chips, KV heads, head size and block
-size.
+of a transfer need the same KV heads, head size and block size, and must list
+their KV in the same number of parts per cache. A part is one chip's share of
+the cache by default. A server with fewer chips than the other sets
+`"tt_kv_parts"` in `kv_connector_extra_config` to the other's chip count: with
+`"tt_kv_parts": 2`, a one-chip server lists each cache as the two halves that
+the chips of a two-chip server hold.
 
 ## Minimum implementation
 

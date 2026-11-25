@@ -777,10 +777,15 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     for name in group.layer_names
                 },
             )
-            if self.vllm_config.kv_transfer_config.kv_buffer_device == "tt":
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            if kv_transfer_config.kv_buffer_device == "tt":
                 # The connector transfers the card's DRAM itself.
                 connector.register_kv_caches(
-                    kv_dram_layout(kv_tensors, kv_cache_config.num_blocks)
+                    kv_dram_layout(
+                        kv_tensors,
+                        kv_cache_config.num_blocks,
+                        kv_transfer_config.get_from_extra_config("tt_kv_parts", None),
+                    )
                 )
             else:
                 connector.register_kv_caches(

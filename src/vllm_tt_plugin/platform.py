@@ -921,7 +921,7 @@ def _install_tt_nixl_dram_registration_patch() -> None:
             for region in layout.regions[name]:
                 base_addresses.append(region.card << _NIXL_CARD_SHIFT | region.addr)
                 self.block_len_per_layer.append(region.block_bytes)
-                self.block_stride_per_layer.append(region.block_bytes)
+                self.block_stride_per_layer.append(region.block_stride)
                 self.region_group_ids.append(group_by_layer[name])
                 self.region_names.append(name)
                 self.region_num_blocks.append(num_blocks)

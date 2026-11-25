@@ -58,13 +58,14 @@ def _bfloat8_block_bytes_per_bank(cache, num_banks: int) -> int:
 class DramRegion(NamedTuple):
     """One KV cache's share of one DRAM bank, as a NIXL transfer names it.
 
-    Block ``b`` of the cache is the ``block_bytes`` bytes at
-    ``addr + b * block_bytes``.
+    Block ``b`` of the region is the ``block_bytes`` bytes at
+    ``addr + b * block_stride``.
     """
 
     card: int  # N of /dev/tenstorrent/N
     addr: int  # (bank << 32) | address inside the bank
     block_bytes: int
+    block_stride: int
 
 
 class KVDramLayout(NamedTuple):
@@ -76,9 +77,18 @@ class KVDramLayout(NamedTuple):
     banks: list[tuple[int, int, int]]
 
 
-def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayout:
+def kv_dram_layout(
+    kv_tensors: dict[str, tuple], num_blocks: int, parts: int | None = None
+) -> KVDramLayout:
     """The DRAM regions of each layer's KV, for a connector that transfers
     card memory directly.
+
+    Each cache is listed in ``parts`` equal parts, a region per bank for each
+    part. By default a part is one chip's share of the cache. A server with
+    fewer chips than the other server of a transfer sets ``parts`` to that
+    server's chip count: each chip holds an equal share of the KV heads in chip
+    order, so half of a one-chip block in each bank is what the first of two
+    chips holds of that block in the same bank.
 
     Addresses are in the form NIXL's Tenstorrent build takes. A transfer moves
     a region's bytes unchanged, so the cache must be bfloat8_b and the other
@@ -102,10 +112,26 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
                     f"{cache.buffer_aligned_page_size()} bytes, not one "
                     f"bfloat8_b tile of {_BFLOAT8_TILE_BYTES}."
                 )
-            block_bytes = _bfloat8_block_bytes_per_bank(cache, _DRAM_BANKS)
+            device_ids = cache.device().get_device_ids()
+            block_stride = _bfloat8_block_bytes_per_bank(cache, _DRAM_BANKS)
+            parts_per_chip, remainder = divmod(
+                parts or len(device_ids), len(device_ids)
+            )
+            block_bytes = block_stride // max(parts_per_chip, 1)
+            if (
+                remainder
+                or not parts_per_chip
+                or block_stride % parts_per_chip
+                or block_bytes % _BFLOAT8_TILE_BYTES
+            ):
+                raise ValueError(
+                    f"Layer {name}: a KV cache on {len(device_ids)} chip(s) with "
+                    f"{block_stride // _BFLOAT8_TILE_BYTES} tiles a block in each "
+                    f"DRAM bank cannot be listed in {parts} equal parts."
+                )
             # On a mesh each chip has its share of the cache, at the same
             # buffer address.
-            for device_id in cache.device().get_device_ids():
+            for device_id in device_ids:
                 bank_table = ttnn.cluster.get_dram_bank_table(device_id)
                 if len(bank_table) != _DRAM_BANKS:
                     raise ValueError(
@@ -120,17 +146,25 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
                 card = card_by_device[device_id]
                 for bank in bank_table:
                     in_bank = cache.buffer_address() + bank["base_addr"]
-                    if in_bank + num_blocks * block_bytes > bank["bank_size"]:
+                    if in_bank + num_blocks * block_stride > bank["bank_size"]:
                         raise ValueError(
                             f"Layer {name}: {num_blocks} KV blocks at "
                             f"{in_bank:#x} do not fit DRAM bank "
                             f"{bank['bank_id']} of device {device_id}."
                         )
                     bank_addr = bank["bank_id"] << 32
-                    regions[name].append(
-                        DramRegion(card, bank_addr | in_bank, block_bytes)
-                    )
                     banks[card, bank["bank_id"]] = (bank_addr, bank["bank_size"], card)
+                # A part at a time, each in every bank: the order another
+                # server lists the same parts in when they are its chips.
+                for part in range(parts_per_chip):
+                    for bank in bank_table:
+                        addr = (
+                            bank["bank_id"] << 32
+                            | cache.buffer_address() + bank["base_addr"]
+                        ) + part * block_bytes
+                        regions[name].append(
+                            DramRegion(card, addr, block_bytes, block_stride)
+                        )
     return KVDramLayout(regions, list(banks.values()))
 
 
