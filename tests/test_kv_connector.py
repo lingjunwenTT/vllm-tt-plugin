@@ -475,6 +475,82 @@ def test_a_kv_block_that_does_not_divide_over_the_banks_is_refused():
         kv_transfer._bfloat8_block_bytes_per_bank(cache, BANKS)
 
 
+BANK_BYTES = 0xFF000000
+
+
+class FakeDramKVTensor:
+    """One layer's bfloat8_b K or V on one chip: 4 tiles a block in each bank."""
+
+    dtype = kv_transfer.ttnn.bfloat8_b
+    shape = (PACKED_BLOCKS, 4, 64, 128)
+
+    def __init__(self, address: int, device_ids=(0,)):
+        self.address = address
+        self.device_ids = list(device_ids)
+
+    def buffer_address(self):
+        return self.address
+
+    def buffer_aligned_page_size(self):
+        return 1088
+
+    def device(self):
+        return SimpleNamespace(get_device_ids=lambda: self.device_ids)
+
+
+@pytest.fixture
+def fake_dram_banks(monkeypatch):
+    """Every device has all of a Blackhole chip's DRAM banks in use."""
+    banks = [
+        {"bank_id": bank, "base_addr": 0, "bank_size": BANK_BYTES}
+        for bank in range(BANKS)
+    ]
+    monkeypatch.setattr(
+        kv_transfer.ttnn.cluster, "get_dram_bank_table", lambda _device_id: banks
+    )
+    return banks
+
+
+def test_a_layers_kv_is_a_dram_region_per_cache_and_bank(fake_dram_banks):
+    k, v = FakeDramKVTensor(0x100000), FakeDramKVTensor(0x900000)
+
+    layout = kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
+
+    block_bytes = 4 * 1088
+    assert layout.regions["layers.0"] == [
+        kv_transfer.DramRegion(0, bank << 32 | cache.address, block_bytes)
+        for cache in (k, v)
+        for bank in range(BANKS)
+    ]
+    # Both caches are in the same banks, and a bank is registered once, whole.
+    assert layout.banks == [(bank << 32, BANK_BYTES, 0) for bank in range(BANKS)]
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda k, banks: setattr(k, "dtype", "bfloat16"), "needs a bfloat8_b"),
+        (lambda k, banks: setattr(k, "device_ids", [0, 1]), "on one chip.*is on 2"),
+        (lambda k, banks: banks.pop(), "has 7 DRAM banks in use"),
+        (
+            lambda k, banks: setattr(k, "address", BANK_BYTES - 1088),
+            "do not fit DRAM bank 0",
+        ),
+        (
+            lambda k, banks: setattr(k, "buffer_aligned_page_size", lambda: 2048),
+            "pages of 2048 bytes",
+        ),
+    ],
+)
+def test_kv_that_nixl_cannot_address_in_dram_is_refused(
+    fake_dram_banks, change, message
+):
+    k, v = FakeDramKVTensor(0x100000), FakeDramKVTensor(0x900000)
+    change(k, fake_dram_banks)
+    with pytest.raises(ValueError, match=message):
+        kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
+
+
 def _model_kv_caches(num_layers: int = 2) -> list:
     return [[FakePackedKVTensor(), FakePackedKVTensor()] for _ in range(num_layers)]
 

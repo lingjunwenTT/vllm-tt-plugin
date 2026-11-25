@@ -3,6 +3,8 @@
 
 """What ``TTModelRunner`` gives a worker-side KV connector."""
 
+from typing import NamedTuple
+
 import numpy as np
 import torch
 import ttnn
@@ -17,6 +19,10 @@ _BFLOAT8_TILE_BYTES = 1088
 # 1x2 Blackhole mesh, the rate falls from about 9.5 GB/s to under 7 GB/s
 # between 128 and 512 blocks in one device transfer.
 _MAX_RUN_BLOCKS = 64
+
+# DRAM banks of a Blackhole chip. NIXL's Tenstorrent build numbers a chip's
+# banks 0 to 7, which are ttnn's bank IDs only when all 8 are in use.
+_DRAM_BANKS = 8
 
 
 def _bfloat8_block_bytes(cache) -> int:
@@ -46,6 +52,87 @@ def _bfloat8_block_bytes_per_bank(cache, num_banks: int) -> int:
             f"{num_banks} DRAM banks, so it is not one byte range per bank."
         )
     return tiles_per_bank * _BFLOAT8_TILE_BYTES
+
+
+class DramRegion(NamedTuple):
+    """One KV cache's share of one DRAM bank, as a NIXL transfer names it.
+
+    Block ``b`` of the cache is the ``block_bytes`` bytes at
+    ``addr + b * block_bytes``.
+    """
+
+    card: int  # N of /dev/tenstorrent/N
+    addr: int  # (bank << 32) | address inside the bank
+    block_bytes: int
+
+
+class KVDramLayout(NamedTuple):
+    """Where the model's KV is in card DRAM."""
+
+    # Per layer name: K's region in each bank, then V's.
+    regions: dict[str, list[DramRegion]]
+    # ``(addr, bytes, card)`` of every bank that holds a region, each once.
+    banks: list[tuple[int, int, int]]
+
+
+def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayout:
+    """The DRAM regions of each layer's KV, for a connector that transfers
+    card memory directly.
+
+    Addresses are in the form NIXL's Tenstorrent build takes. A transfer moves
+    a region's bytes unchanged, so the cache must be bfloat8_b and the other
+    server must have the same regions: the same KV heads, head size, block
+    size and DRAM banks.
+    """
+    regions: dict[str, list[DramRegion]] = {}
+    banks: dict[tuple[int, int], tuple[int, int, int]] = {}
+    for name, caches in kv_tensors.items():
+        regions[name] = []
+        for cache in caches:
+            if cache.dtype != ttnn.bfloat8_b:
+                raise ValueError(
+                    f"A KV connector needs a bfloat8_b KV cache; layer {name} "
+                    f"has {cache.dtype}."
+                )
+            if cache.buffer_aligned_page_size() != _BFLOAT8_TILE_BYTES:
+                raise ValueError(
+                    f"Layer {name}: the KV cache has pages of "
+                    f"{cache.buffer_aligned_page_size()} bytes, not one "
+                    f"bfloat8_b tile of {_BFLOAT8_TILE_BYTES}."
+                )
+            device_ids = cache.device().get_device_ids()
+            if len(device_ids) != 1:
+                raise ValueError(
+                    "Transferring KV directly from card memory needs a KV cache "
+                    f"on one chip; layer {name} is on {len(device_ids)}."
+                )
+            (device_id,) = device_ids
+            bank_table = ttnn.cluster.get_dram_bank_table(device_id)
+            if len(bank_table) != _DRAM_BANKS:
+                raise ValueError(
+                    f"Device {device_id} has {len(bank_table)} DRAM banks in "
+                    f"use; transferring KV directly needs all {_DRAM_BANKS}."
+                )
+            block_bytes = _bfloat8_block_bytes_per_bank(cache, _DRAM_BANKS)
+            card = _card_of_device(device_id)
+            for bank in bank_table:
+                in_bank = cache.buffer_address() + bank["base_addr"]
+                if in_bank + num_blocks * block_bytes > bank["bank_size"]:
+                    raise ValueError(
+                        f"Layer {name}: {num_blocks} KV blocks at {in_bank:#x} "
+                        f"do not fit DRAM bank {bank['bank_id']} of device "
+                        f"{device_id}."
+                    )
+                bank_addr = bank["bank_id"] << 32
+                regions[name].append(DramRegion(card, bank_addr | in_bank, block_bytes))
+                banks[card, bank["bank_id"]] = (bank_addr, bank["bank_size"], card)
+    return KVDramLayout(regions, list(banks.values()))
+
+
+def _card_of_device(device_id: int) -> int:
+    """N of the ``/dev/tenstorrent/N`` that is ttnn's device ``device_id``."""
+    # TODO: taken to be the same number; not yet checked on hardware.
+    return device_id
 
 
 def kv_cache_descriptions(

@@ -89,6 +89,7 @@ class ClusterType(Enum):
 class _Cluster:
     ClusterType = ClusterType
     get_cluster_type = staticmethod(_no_device("cluster.get_cluster_type"))
+    get_dram_bank_table = staticmethod(_no_device("cluster.get_dram_bank_table"))
     serialize_cluster_descriptor = staticmethod(
         _no_device("cluster.serialize_cluster_descriptor")
     )
