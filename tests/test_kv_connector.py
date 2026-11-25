@@ -552,9 +552,22 @@ class FakeDramKVTensor:
         return SimpleNamespace(get_device_ids=lambda: self.device_ids)
 
 
+def _fake_cluster_descriptor(monkeypatch, tmp_path, card_by_device: dict) -> None:
+    path = tmp_path / "cluster_descriptor.yaml"
+    path.write_text(
+        "chips_with_mmio:\n"
+        + "".join(f"  - {d}: {card}\n" for d, card in card_by_device.items())
+    )
+    monkeypatch.setattr(
+        kv_transfer.ttnn.cluster, "serialize_cluster_descriptor", lambda: str(path)
+    )
+
+
 @pytest.fixture
-def fake_dram_banks(monkeypatch):
-    """Every device has all of a Blackhole chip's DRAM banks in use."""
+def fake_dram_banks(monkeypatch, tmp_path):
+    """Every device has all of a Blackhole chip's DRAM banks in use, and is
+    the card of the same number."""
+    _fake_cluster_descriptor(monkeypatch, tmp_path, {d: d for d in range(8)})
     banks = [
         {"bank_id": bank, "base_addr": 0, "bank_size": BANK_BYTES}
         for bank in range(BANKS)
@@ -580,6 +593,21 @@ def test_a_layers_kv_is_a_dram_region_per_cache_and_bank(fake_dram_banks):
     assert layout.banks == [(bank << 32, BANK_BYTES, 0) for bank in range(BANKS)]
 
 
+def test_a_devices_card_is_the_one_the_cluster_descriptor_names(
+    fake_dram_banks, monkeypatch, tmp_path
+):
+    # As seen with /dev/tenstorrent/21 and /29 visible: ttnn numbers them in
+    # PCI address order, which is not the order of their card numbers.
+    _fake_cluster_descriptor(monkeypatch, tmp_path, {0: 29, 1: 21})
+    k = FakeDramKVTensor(0x100000, device_ids=[1])
+    v = FakeDramKVTensor(0x900000, device_ids=[1])
+
+    layout = kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
+
+    assert {region.card for region in layout.regions["layers.0"]} == {21}
+    assert {card for _, _, card in layout.banks} == {21}
+
+
 def test_a_mesh_has_dram_regions_on_each_chips_card(fake_dram_banks):
     k = FakeDramKVTensor(0x100000, device_ids=[2, 5])
     v = FakeDramKVTensor(0x900000, device_ids=[2, 5])
@@ -602,6 +630,7 @@ def test_a_mesh_has_dram_regions_on_each_chips_card(fake_dram_banks):
     [
         (lambda k, banks: setattr(k, "dtype", "bfloat16"), "needs a bfloat8_b"),
         (lambda k, banks: banks.pop(), "has 7 DRAM banks in use"),
+        (lambda k, banks: setattr(k, "device_ids", [9]), "Device 9 is not a PCIe"),
         (
             lambda k, banks: setattr(k, "address", BANK_BYTES - 1088),
             "do not fit DRAM bank 0",

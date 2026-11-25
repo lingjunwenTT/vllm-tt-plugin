@@ -8,6 +8,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 import ttnn
+import yaml
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -86,6 +87,7 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
     """
     regions: dict[str, list[DramRegion]] = {}
     banks: dict[tuple[int, int], tuple[int, int, int]] = {}
+    card_by_device = _card_by_device()
     for name, caches in kv_tensors.items():
         regions[name] = []
         for cache in caches:
@@ -110,7 +112,12 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
                         f"Device {device_id} has {len(bank_table)} DRAM banks in "
                         f"use; transferring KV directly needs all {_DRAM_BANKS}."
                     )
-                card = _card_of_device(device_id)
+                if device_id not in card_by_device:
+                    raise ValueError(
+                        f"Device {device_id} is not a PCIe card of this host, so "
+                        "NIXL cannot reach its DRAM."
+                    )
+                card = card_by_device[device_id]
                 for bank in bank_table:
                     in_bank = cache.buffer_address() + bank["base_addr"]
                     if in_bank + num_blocks * block_bytes > bank["bank_size"]:
@@ -127,10 +134,19 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
     return KVDramLayout(regions, list(banks.values()))
 
 
-def _card_of_device(device_id: int) -> int:
-    """N of the ``/dev/tenstorrent/N`` that is ttnn's device ``device_id``."""
-    # TODO: taken to be the same number; not yet checked on hardware.
-    return device_id
+def _card_by_device() -> dict[int, int]:
+    """N of ``/dev/tenstorrent/N`` for each ttnn device ID of this process.
+
+    The two differ: ttnn numbers the cards it was allowed to open from 0, in
+    PCI address order. ttnn's cluster descriptor lists the card of each.
+    """
+    with open(ttnn.cluster.serialize_cluster_descriptor()) as f:
+        descriptor = yaml.load(f, Loader=yaml.BaseLoader)
+    return {
+        int(device_id): int(card)
+        for entry in descriptor["chips_with_mmio"]
+        for device_id, card in entry.items()
+    }
 
 
 def kv_cache_descriptions(
