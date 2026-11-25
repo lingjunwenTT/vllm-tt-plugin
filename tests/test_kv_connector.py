@@ -39,7 +39,11 @@ from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.platform import TTPlatform, _install_tt_nixl_single_rank_patch
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _install_tt_nixl_dram_registration_patch,
+    _install_tt_nixl_single_rank_patch,
+)
 
 
 class FakeKVMetadata(KVConnectorMetadata):
@@ -164,8 +168,9 @@ def _nixl_connector(vllm_config, kv_buffer_device: str, num_blocks: int = 4):
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.self_attn"], spec)],
     )
-    # The platform config hook installs this in a server.
+    # The platform config hook installs these in a server.
     _install_tt_nixl_single_rank_patch()
+    _install_tt_nixl_dram_registration_patch()
     connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
     return connector, kv_cache_config
 
@@ -572,6 +577,131 @@ def test_kv_that_nixl_cannot_address_in_dram_is_refused(
     change(k, fake_dram_banks)
     with pytest.raises(ValueError, match=message):
         kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
+
+
+class RecordingNixl:
+    """Stands in for a connector worker's NIXL agent where it would touch a
+    card: registering memory and preparing descriptor lists."""
+
+    def __init__(self, monkeypatch, worker):
+        self.registered: list = []
+        self.prepared: dict[str, np.ndarray] = {}
+        for name in (
+            "get_reg_descs",
+            "register_memory",
+            "deregister_memory",
+            "prep_xfer_dlist",
+            "release_dlist_handle",
+        ):
+            monkeypatch.setattr(worker.nixl_wrapper, name, getattr(self, name))
+
+    def get_reg_descs(self, ranges, mem_type):
+        return (ranges, mem_type)
+
+    def register_memory(self, descs, backends):
+        self.registered.append(descs)
+
+    def deregister_memory(self, descs):
+        self.registered.remove(descs)
+
+    def prep_xfer_dlist(self, agent_name, descs, mem_type):
+        assert mem_type == "VRAM"
+        self.prepared[agent_name] = descs
+        return len(self.prepared)
+
+    def release_dlist_handle(self, handle):
+        pass
+
+
+def _dram_layout(card: int = 0, num_blocks: int = 4) -> kv_transfer.KVDramLayout:
+    k = FakeDramKVTensor(0x100000, device_ids=[card])
+    v = FakeDramKVTensor(0x900000, device_ids=[card])
+    return kv_transfer.kv_dram_layout({"model.layers.0.self_attn": (k, v)}, num_blocks)
+
+
+def test_the_nixl_connector_registers_kv_in_card_dram(
+    vllm_config, monkeypatch, fake_dram_banks
+):
+    connector, kv_cache_config = _nixl_connector(vllm_config, "tt")
+    nixl = RecordingNixl(monkeypatch, connector.connector_worker)
+    layout = _dram_layout(card=3, num_blocks=kv_cache_config.num_blocks)
+    try:
+        connector.register_kv_caches(layout)
+
+        # Each bank once, whole, as card memory.
+        assert nixl.registered == [
+            ([(bank << 32, BANK_BYTES, 3, "") for bank in range(BANKS)], "VRAM")
+        ]
+        # A strided descriptor per region: K's 8 banks, then V's.
+        regions = layout.regions["model.layers.0.self_attn"]
+        block_bytes = 4 * 1088
+        assert nixl.prepared["NIXL_INIT_AGENT"].tolist() == [
+            [r.addr, block_bytes, 3, block_bytes, kv_cache_config.num_blocks]
+            for r in regions
+        ]
+        # What the other server learns in the handshake.
+        metadata = _handshake_metadata(connector)
+        assert metadata.kv_caches_base_addr == [r.addr for r in regions]
+        assert metadata.device_id == 3
+        assert metadata.block_lens == [block_bytes] * 2 * BANKS
+        assert metadata.region_mem_types == ["VRAM"] * 2 * BANKS
+    finally:
+        connector.shutdown()
+
+
+def _handshake_metadata(connector):
+    import msgspec
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    payload = connector.connector_worker.xfer_handshake_metadata
+    return msgspec.msgpack.decode(payload.agent_metadata_bytes, type=NixlAgentMetadata)
+
+
+def _changed_attributes(worker, register) -> set[str]:
+    def snapshot():
+        return {
+            name: (id(value), len(value) if hasattr(value, "__len__") else None)
+            for name, value in vars(worker).items()
+        }
+
+    before = snapshot()
+    register()
+    after = snapshot()
+    return {name for name in after if before.get(name) != after[name]}
+
+
+def test_registering_card_dram_records_what_upstream_records_for_tensors(
+    vllm_config, monkeypatch, fake_dram_banks
+):
+    """The DRAM registration replaces an upstream method that other upstream
+    code reads the records of. If a vLLM update makes it record more, this
+    fails."""
+    upstream, kv_cache_config = _nixl_connector(vllm_config, "cpu")
+    spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    k = FakePackedKVTensor(heads=spec.num_kv_heads // CHIPS)
+    kv_tensors = {"model.layers.0.self_attn": (k, FakePackedKVTensor(k.shape[1]))}
+    ours, _ = _nixl_connector(vllm_config, "tt")
+    RecordingNixl(monkeypatch, ours.connector_worker)
+    try:
+        by_upstream = _changed_attributes(
+            upstream.connector_worker,
+            lambda: upstream.register_kv_caches(
+                kv_cache_descriptions(kv_cache_config, kv_tensors)
+            ),
+        )
+        by_ours = _changed_attributes(
+            ours.connector_worker,
+            lambda: ours.register_kv_caches(
+                _dram_layout(num_blocks=kv_cache_config.num_blocks)
+            ),
+        )
+        # The CPU buffer itself is the only record card DRAM does not need.
+        assert by_upstream - by_ours == {"host_xfer_buffers"}
+    finally:
+        upstream.shutdown()
+        ours.shutdown()
 
 
 def _model_kv_caches(num_layers: int = 2) -> list:

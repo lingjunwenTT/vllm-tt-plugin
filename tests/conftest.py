@@ -124,6 +124,10 @@ def reset_tt_platform_class_state():
             "get_tensor_model_parallel_world_size",
         ):
             setattr(nixl_worker, name, getattr(parallel_state, name))
+        worker_cls = nixl_worker.NixlBaseConnectorWorker
+        worker_cls.register_kv_caches = getattr(
+            worker_cls.register_kv_caches, "upstream", worker_cls.register_kv_caches
+        )
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
