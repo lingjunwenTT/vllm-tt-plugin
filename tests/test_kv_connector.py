@@ -441,6 +441,40 @@ def test_a_long_stretch_of_blocks_is_copied_in_pieces():
     assert max(count for _, _, count in runs) == kv_transfer._MAX_RUN_BLOCKS
 
 
+BANKS = 8
+
+
+def _deal_tiles_over_banks(tiles: np.ndarray) -> list[np.ndarray]:
+    """A DRAM tensor's tiles as ttnn stores them: tile ``i`` is in bank
+    ``i % BANKS``, ``i // BANKS`` tiles into that bank's share."""
+    return [tiles[bank::BANKS].reshape(-1) for bank in range(BANKS)]
+
+
+def test_a_kv_block_is_one_byte_range_in_each_dram_bank():
+    # 16 tiles a block: two in each of the 8 banks.
+    cache = SimpleNamespace(shape=(PACKED_BLOCKS, 2, 64, 128))
+    tiles = np.random.default_rng(0).integers(
+        0, 256, (PACKED_BLOCKS * 16, 1088), dtype=np.uint8
+    )
+    banks = _deal_tiles_over_banks(tiles)
+
+    piece = kv_transfer._bfloat8_block_bytes_per_bank(cache, BANKS)
+
+    assert piece == 2 * 1088
+    block = 5
+    block_tiles = tiles[block * 16 : (block + 1) * 16]
+    for bank, data in enumerate(banks):
+        in_bank = data[block * piece : (block + 1) * piece]
+        assert (in_bank == block_tiles[bank::BANKS].reshape(-1)).all()
+
+
+def test_a_kv_block_that_does_not_divide_over_the_banks_is_refused():
+    # 4 tiles a block.
+    cache = SimpleNamespace(shape=(PACKED_BLOCKS, 1, 32, 128))
+    with pytest.raises(ValueError, match="4 tiles does not divide evenly over 8"):
+        kv_transfer._bfloat8_block_bytes_per_bank(cache, BANKS)
+
+
 def _model_kv_caches(num_layers: int = 2) -> list:
     return [[FakePackedKVTensor(), FakePackedKVTensor()] for _ in range(num_layers)]
 

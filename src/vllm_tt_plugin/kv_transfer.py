@@ -28,6 +28,26 @@ def _bfloat8_block_bytes(cache) -> int:
     return heads * (block_size // 32) * (head_dim // 32) * _BFLOAT8_TILE_BYTES
 
 
+def _bfloat8_block_bytes_per_bank(cache, num_banks: int) -> int:
+    """Bytes one block takes in each DRAM bank of a chip, for a bfloat8_b KV cache.
+
+    ttnn stores a DRAM tensor one tile per page and deals the pages round-robin
+    over the chip's banks: tile ``i`` is in bank ``i % num_banks``, at
+    ``(i // num_banks)`` tiles past the tensor's buffer address in that bank.
+    When a block's tiles divide evenly over the banks, every block starts at
+    bank 0, so block ``b`` is one byte range per bank, each of the returned
+    size and each ``b`` times that size past the buffer address.
+    """
+    block_tiles = _bfloat8_block_bytes(cache) // _BFLOAT8_TILE_BYTES
+    tiles_per_bank, remainder = divmod(block_tiles, num_banks)
+    if remainder:
+        raise ValueError(
+            f"A KV block of {block_tiles} tiles does not divide evenly over "
+            f"{num_banks} DRAM banks, so it is not one byte range per bank."
+        )
+    return tiles_per_bank * _BFLOAT8_TILE_BYTES
+
+
 def kv_cache_descriptions(
     kv_cache_config: KVCacheConfig, kv_tensors: dict[str, tuple]
 ) -> dict[str, torch.Tensor]:
