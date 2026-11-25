@@ -125,9 +125,9 @@ def reset_tt_platform_class_state():
         ):
             setattr(nixl_worker, name, getattr(parallel_state, name))
         worker_cls = nixl_worker.NixlBaseConnectorWorker
-        worker_cls.register_kv_caches = getattr(
-            worker_cls.register_kv_caches, "upstream", worker_cls.register_kv_caches
-        )
+        for name in ("register_kv_caches", "_build_fa_local", "_build_fa_remote"):
+            method = getattr(worker_cls, name)
+            setattr(worker_cls, name, getattr(method, "upstream", method))
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler

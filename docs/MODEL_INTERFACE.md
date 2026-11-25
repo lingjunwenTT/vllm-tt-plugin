@@ -75,11 +75,12 @@ transfers the card's DRAM itself, which needs NIXL's Tenstorrent build. The
 runner then passes `register_kv_caches` a `KVDramLayout` instead of the
 descriptions, and does not call `set_host_xfer_buffer_ops`. ttnn deals a DRAM
 tensor's tiles round-robin over the chip's 8 DRAM banks, so the layout lists,
-per layer name, K's byte range in each bank and then V's, and each bank to
-register. A block is the same number of bytes in every range. Startup raises
-unless every cache is `bfloat8_b`, is on one chip with all 8 banks in use, and
-has blocks whose tiles divide evenly over the banks. Both servers of a
-transfer need the same KV heads, head size and block size.
+per layer name, K's byte range in each bank of each chip and then V's, and
+each bank to register. A block is the same number of bytes in every range.
+Startup raises unless every cache is `bfloat8_b`, is on chips with all 8 banks
+in use, and has blocks whose tiles divide evenly over the banks. Both servers
+of a transfer need the same number of chips, KV heads, head size and block
+size.
 
 ## Minimum implementation
 

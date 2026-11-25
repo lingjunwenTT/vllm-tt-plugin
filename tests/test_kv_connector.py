@@ -580,11 +580,27 @@ def test_a_layers_kv_is_a_dram_region_per_cache_and_bank(fake_dram_banks):
     assert layout.banks == [(bank << 32, BANK_BYTES, 0) for bank in range(BANKS)]
 
 
+def test_a_mesh_has_dram_regions_on_each_chips_card(fake_dram_banks):
+    k = FakeDramKVTensor(0x100000, device_ids=[2, 5])
+    v = FakeDramKVTensor(0x900000, device_ids=[2, 5])
+
+    layout = kv_transfer.kv_dram_layout({"layers.0": (k, v)}, PACKED_BLOCKS)
+
+    assert layout.regions["layers.0"] == [
+        kv_transfer.DramRegion(card, bank << 32 | cache.address, 4 * 1088)
+        for cache in (k, v)
+        for card in (2, 5)
+        for bank in range(BANKS)
+    ]
+    assert layout.banks == [
+        (bank << 32, BANK_BYTES, card) for card in (2, 5) for bank in range(BANKS)
+    ]
+
+
 @pytest.mark.parametrize(
     "change, message",
     [
         (lambda k, banks: setattr(k, "dtype", "bfloat16"), "needs a bfloat8_b"),
-        (lambda k, banks: setattr(k, "device_ids", [0, 1]), "on one chip.*is on 2"),
         (lambda k, banks: banks.pop(), "has 7 DRAM banks in use"),
         (
             lambda k, banks: setattr(k, "address", BANK_BYTES - 1088),
@@ -721,10 +737,40 @@ def test_the_nixl_connector_registers_kv_in_card_dram(
         ]
         # What the other server learns in the handshake.
         metadata = _handshake_metadata(connector)
-        assert metadata.kv_caches_base_addr == [r.addr for r in regions]
-        assert metadata.device_id == 3
         assert metadata.block_lens == [block_bytes] * 2 * BANKS
         assert metadata.region_mem_types == ["VRAM"] * 2 * BANKS
+        # ... including each region's card, which the worker's one device ID
+        # cannot say. This server asks NIXL for the same regions on the same
+        # cards when it is the remote one.
+        one_rank = SimpleNamespace(source_ranks_per_group=[[0]], rank_offset_factor=0)
+        remote = connector.connector_worker._build_fa_remote(one_rank, metadata, 1)
+        assert remote.tolist() == nixl.prepared["NIXL_INIT_AGENT"].tolist()
+    finally:
+        connector.shutdown()
+
+
+def test_the_nixl_connector_names_the_card_of_each_region_of_a_mesh(
+    vllm_config, monkeypatch, fake_dram_banks
+):
+    connector, kv_cache_config = _nixl_connector(vllm_config, "tt")
+    nixl = RecordingNixl(monkeypatch, connector.connector_worker)
+    k = FakeDramKVTensor(0x100000, device_ids=[2, 5])
+    v = FakeDramKVTensor(0x900000, device_ids=[2, 5])
+    layout = kv_transfer.kv_dram_layout(
+        {"model.layers.0.self_attn": (k, v)}, kv_cache_config.num_blocks
+    )
+    try:
+        connector.register_kv_caches(layout)
+
+        local = nixl.prepared["NIXL_INIT_AGENT"]
+        regions = layout.regions["model.layers.0.self_attn"]
+        assert local[:, 0].tolist() == [r.addr for r in regions]
+        assert local[:, 2].tolist() == [r.card for r in regions]
+        one_rank = SimpleNamespace(source_ranks_per_group=[[0]], rank_offset_factor=0)
+        remote = connector.connector_worker._build_fa_remote(
+            one_rank, _handshake_metadata(connector), 1
+        )
+        assert remote.tolist() == local.tolist()
     finally:
         connector.shutdown()
 

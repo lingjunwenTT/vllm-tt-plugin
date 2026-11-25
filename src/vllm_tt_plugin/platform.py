@@ -838,6 +838,11 @@ def _install_tt_nixl_single_rank_patch() -> None:
     base_worker.get_tensor_model_parallel_world_size = lambda: 1
 
 
+# A card DRAM address is a bank number above 32 address bits. Bits from here up
+# are free to carry the card.
+_NIXL_CARD_SHIFT = 40
+
+
 def _install_tt_nixl_dram_registration_patch() -> None:
     """Let the NIXL connector worker register KV that is in card DRAM.
 
@@ -888,13 +893,6 @@ def _install_tt_nixl_dram_registration_patch() -> None:
                 '"kv_buffer_device": "tt", for attention layers, without '
                 "pipeline parallelism."
             )
-        cards = {r.card for regions in layout.regions.values() for r in regions}
-        if len(cards) != 1:
-            raise NotImplementedError(
-                f"KV in the DRAM of several cards {sorted(cards)} cannot be "
-                "transferred directly yet."
-            )
-
         num_blocks = self.kv_cache_config.num_blocks
         self.transfer_topo = base_worker.TransferTopology(
             tp_rank=self.transfer_tp_rank,
@@ -921,14 +919,16 @@ def _install_tt_nixl_dram_registration_patch() -> None:
         group_by_layer = self.kv_cache_config.transfer_group_index_by_layer
         for name in sorted(layout.regions, key=base_worker._region_sort_key):
             for region in layout.regions[name]:
-                base_addresses.append(region.addr)
+                base_addresses.append(region.card << _NIXL_CARD_SHIFT | region.addr)
                 self.block_len_per_layer.append(region.block_bytes)
                 self.block_stride_per_layer.append(region.block_bytes)
                 self.region_group_ids.append(group_by_layer[name])
                 self.region_names.append(name)
                 self.region_num_blocks.append(num_blocks)
                 self._region_is_mla.append(False)
-        (self.device_id,) = cards
+        # The card is in each base address instead; see ``card_from_address``.
+        self.device_id = 0
+        self.tt_card_in_address = True
         self._head_sharded_draft_regions = self._get_head_sharded_draft_regions()
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = base_addresses
         self.num_regions = len(base_addresses)
@@ -991,6 +991,35 @@ def _install_tt_nixl_dram_registration_patch() -> None:
 
     register_kv_caches.upstream = upstream
     worker_cls.register_kv_caches = register_kv_caches
+
+    def card_from_address(build_descs):
+        """Give each descriptor its own NIXL device ID.
+
+        The worker has one device ID for all its regions and sends the other
+        server one. A mesh's regions are on several cards, so a region's card
+        travels in the high bits of its base address, which a card address
+        does not use. ``build_descs`` returns rows of ``(address, bytes,
+        device ID, stride, count)``: move the card from the address to the
+        device ID.
+        """
+
+        def build(self, *args, **kwargs):
+            descs = build_descs(self, *args, **kwargs)
+            if getattr(self, "tt_card_in_address", False):
+                descs[:, 2] = descs[:, 0] >> _NIXL_CARD_SHIFT
+                descs[:, 0] &= (1 << _NIXL_CARD_SHIFT) - 1
+            return descs
+
+        build.upstream = build_descs
+        return build
+
+    for name in ("_build_fa_local", "_build_fa_remote"):
+        if not hasattr(worker_cls, name):
+            raise RuntimeError(
+                f"vLLM's NIXL connector worker no longer has {name}; update "
+                "_install_tt_nixl_dram_registration_patch for this vLLM version."
+            )
+        setattr(worker_cls, name, card_from_address(getattr(worker_cls, name)))
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:

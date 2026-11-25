@@ -69,7 +69,7 @@ class DramRegion(NamedTuple):
 class KVDramLayout(NamedTuple):
     """Where the model's KV is in card DRAM."""
 
-    # Per layer name: K's region in each bank, then V's.
+    # Per layer name: K's region in each bank of each chip, then V's.
     regions: dict[str, list[DramRegion]]
     # ``(addr, bytes, card)`` of every bank that holds a region, each once.
     banks: list[tuple[int, int, int]]
@@ -81,8 +81,8 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
 
     Addresses are in the form NIXL's Tenstorrent build takes. A transfer moves
     a region's bytes unchanged, so the cache must be bfloat8_b and the other
-    server must have the same regions: the same KV heads, head size, block
-    size and DRAM banks.
+    server must have the same regions: the same chips, KV heads, head size,
+    block size and DRAM banks.
     """
     regions: dict[str, list[DramRegion]] = {}
     banks: dict[tuple[int, int], tuple[int, int, int]] = {}
@@ -100,32 +100,30 @@ def kv_dram_layout(kv_tensors: dict[str, tuple], num_blocks: int) -> KVDramLayou
                     f"{cache.buffer_aligned_page_size()} bytes, not one "
                     f"bfloat8_b tile of {_BFLOAT8_TILE_BYTES}."
                 )
-            device_ids = cache.device().get_device_ids()
-            if len(device_ids) != 1:
-                raise ValueError(
-                    "Transferring KV directly from card memory needs a KV cache "
-                    f"on one chip; layer {name} is on {len(device_ids)}."
-                )
-            (device_id,) = device_ids
-            bank_table = ttnn.cluster.get_dram_bank_table(device_id)
-            if len(bank_table) != _DRAM_BANKS:
-                raise ValueError(
-                    f"Device {device_id} has {len(bank_table)} DRAM banks in "
-                    f"use; transferring KV directly needs all {_DRAM_BANKS}."
-                )
             block_bytes = _bfloat8_block_bytes_per_bank(cache, _DRAM_BANKS)
-            card = _card_of_device(device_id)
-            for bank in bank_table:
-                in_bank = cache.buffer_address() + bank["base_addr"]
-                if in_bank + num_blocks * block_bytes > bank["bank_size"]:
+            # On a mesh each chip has its share of the cache, at the same
+            # buffer address.
+            for device_id in cache.device().get_device_ids():
+                bank_table = ttnn.cluster.get_dram_bank_table(device_id)
+                if len(bank_table) != _DRAM_BANKS:
                     raise ValueError(
-                        f"Layer {name}: {num_blocks} KV blocks at {in_bank:#x} "
-                        f"do not fit DRAM bank {bank['bank_id']} of device "
-                        f"{device_id}."
+                        f"Device {device_id} has {len(bank_table)} DRAM banks in "
+                        f"use; transferring KV directly needs all {_DRAM_BANKS}."
                     )
-                bank_addr = bank["bank_id"] << 32
-                regions[name].append(DramRegion(card, bank_addr | in_bank, block_bytes))
-                banks[card, bank["bank_id"]] = (bank_addr, bank["bank_size"], card)
+                card = _card_of_device(device_id)
+                for bank in bank_table:
+                    in_bank = cache.buffer_address() + bank["base_addr"]
+                    if in_bank + num_blocks * block_bytes > bank["bank_size"]:
+                        raise ValueError(
+                            f"Layer {name}: {num_blocks} KV blocks at "
+                            f"{in_bank:#x} do not fit DRAM bank "
+                            f"{bank['bank_id']} of device {device_id}."
+                        )
+                    bank_addr = bank["bank_id"] << 32
+                    regions[name].append(
+                        DramRegion(card, bank_addr | in_bank, block_bytes)
+                    )
+                    banks[card, bank["bank_id"]] = (bank_addr, bank["bank_size"], card)
     return KVDramLayout(regions, list(banks.values()))
 
 
