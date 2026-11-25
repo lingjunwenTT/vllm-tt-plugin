@@ -1867,9 +1867,16 @@ class TTPlatform(Platform):
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        # NIXL cannot register TT device memory, so KV is staged through a CPU
-        # buffer: run with ``"kv_buffer_device": "cpu"``.
-        return {"tt": ("cpu",)}
+        # ``"kv_buffer_device": "cpu"`` stages KV through a CPU buffer.
+        # ``"tt"`` has NIXL transfer the card's DRAM itself, which needs
+        # NIXL's Tenstorrent build.
+        return {"tt": ("cpu", "tt")}
+
+    @classmethod
+    def get_nixl_memory_type(cls) -> str:
+        # What NIXL's Tenstorrent build calls card memory. A CPU buffer is
+        # registered as host memory whatever this says.
+        return "VRAM"
 
     @classmethod
     def pre_register_and_update(
@@ -1914,7 +1921,9 @@ class TTPlatform(Platform):
 
     @classmethod
     def set_device(cls, device) -> None:
-        if device is None:
+        # NixlConnector passes its NIXL device ID before a handshake, for
+        # platforms whose threads each need a device context. TT has none.
+        if device is None or isinstance(device, int):
             return
 
         import ttnn

@@ -39,7 +39,7 @@ from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
+from vllm_tt_plugin.platform import TTPlatform, _install_tt_nixl_single_rank_patch
 
 
 class FakeKVMetadata(KVConnectorMetadata):
@@ -139,14 +139,18 @@ def worker_connector(monkeypatch, vllm_config):
     return connector
 
 
-def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
+def _nixl_connector(vllm_config, kv_buffer_device: str, num_blocks: int = 4):
+    """A real worker-side NixlConnector for one attention layer, and its
+    ``kv_cache_config``."""
     pytest.importorskip("nixl")
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
         NixlConnector,
     )
 
     vllm_config.kv_transfer_config = KVTransferConfig(
-        kv_connector="NixlConnector", kv_role="kv_producer", kv_buffer_device="cpu"
+        kv_connector="NixlConnector",
+        kv_role="kv_producer",
+        kv_buffer_device=kv_buffer_device,
     )
     model_config = vllm_config.model_config
     spec = FullAttentionSpec(
@@ -156,17 +160,36 @@ def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
         dtype=model_config.dtype,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=4,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.self_attn"], spec)],
     )
     # The platform config hook installs this in a server.
     _install_tt_nixl_single_rank_patch()
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    return connector, kv_cache_config
 
+
+def test_the_nixl_connector_takes_tt_as_a_buffer_device(vllm_config):
+    connector, _ = _nixl_connector(vllm_config, "tt")
+    try:
+        worker = connector.connector_worker
+        # No CPU buffer: NIXL is to transfer card memory, which its
+        # Tenstorrent build calls VRAM.
+        assert not worker.use_host_buffer
+        assert worker.nixl_memory_type == "VRAM"
+        # The worker hands the platform its NIXL device ID before a handshake.
+        TTPlatform.set_device(worker.device_id)
+    finally:
+        connector.shutdown()
+
+
+def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
+    connector, kv_cache_config = _nixl_connector(vllm_config, "cpu")
+    spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
     k = FakePackedKVTensor(heads=spec.num_kv_heads // CHIPS)
     kv_tensors = {"model.layers.0.self_attn": (k, FakePackedKVTensor(k.shape[1]))}
 
-    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
     try:
         connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, kv_tensors))
 
